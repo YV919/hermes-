@@ -531,3 +531,163 @@ func TestSetAuxiliaryModelCreatesMissingBlock(t *testing.T) {
 		t.Errorf("新建块不应写 timeout, got %v", to.Value)
 	}
 }
+
+// 切换/应用配置时，已启用的委派/辅助块应跟随新配置刷新 provider/base_url/api_key（保留模型名）；
+// auto/未启用的块不动，从不存在的块也不会被新建。
+func TestApplyRefreshesMultiModelCreds(t *testing.T) {
+	tmp := isolateHome(t)
+	// 配置 A：model + 已启用的委派 + 一个已启用辅助(title_generation) + 一个 auto 辅助(vision)
+	orig := `model:
+  default: gpt-5.5
+  provider: custom:cfga
+  base_url: https://a.example.com/v1
+  api_key: sk-aaa
+delegation:
+  model: deepseek-v4-flash
+  provider: custom:cfga
+  base_url: https://a.example.com/v1
+  api_key: sk-aaa
+  max_iterations: 50
+auxiliary:
+  title_generation:
+    provider: custom:cfga
+    model: kimi-k2.7-code
+    base_url: https://a.example.com/v1
+    api_key: sk-aaa
+    timeout: 30
+  vision:
+    provider: auto
+    model: ''
+    base_url: ''
+    api_key: ''
+`
+	cfgPath := filepath.Join(tmp, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(orig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 切到配置 B（不同地址/密钥/名字）
+	p := Profile{Name: "ProfB", BaseURL: "https://b.example.com/v1", APIKey: "sk-bbb", Model: "deepseek-v4-pro"}
+	if _, err := applyProfileToConfig(cfgPath, p); err != nil {
+		t.Fatal(err)
+	}
+	wantProv := "custom:" + providerName(p.Name)
+
+	_, doc, err := loadConfigDoc(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 委派：凭据刷新到 B、模型名保留、max_iterations(int) 保留
+	d := mapGet(doc, "delegation")
+	if v := mapGet(d, "provider"); v == nil || v.Value != wantProv {
+		t.Errorf("delegation.provider 应刷新为 %s, got %v", wantProv, v)
+	}
+	if v := mapGet(d, "base_url"); v == nil || v.Value != p.BaseURL {
+		t.Errorf("delegation.base_url 应刷新为 B, got %v", v)
+	}
+	if v := mapGet(d, "api_key"); v == nil || v.Value != p.APIKey {
+		t.Errorf("delegation.api_key 应刷新为 B, got %v", v)
+	}
+	if v := mapGet(d, "model"); v == nil || v.Value != "deepseek-v4-flash" {
+		t.Errorf("delegation.model 应保留, got %v", v)
+	}
+	if v := mapGet(d, "max_iterations"); v == nil || v.Value != "50" || v.Tag != "!!int" {
+		t.Errorf("delegation.max_iterations 应原样保留为 int 50, got %v", v)
+	}
+
+	// 已启用辅助：凭据刷新、模型名与 timeout 保留
+	tg := mapGet(mapGet(doc, "auxiliary"), "title_generation")
+	if v := mapGet(tg, "base_url"); v == nil || v.Value != p.BaseURL {
+		t.Errorf("auxiliary.title_generation.base_url 应刷新为 B, got %v", v)
+	}
+	if v := mapGet(tg, "api_key"); v == nil || v.Value != p.APIKey {
+		t.Errorf("auxiliary.title_generation.api_key 应刷新为 B, got %v", v)
+	}
+	if v := mapGet(tg, "provider"); v == nil || v.Value != wantProv {
+		t.Errorf("auxiliary.title_generation.provider 应刷新, got %v", v)
+	}
+	if v := mapGet(tg, "model"); v == nil || v.Value != "kimi-k2.7-code" {
+		t.Errorf("auxiliary.title_generation.model 应保留, got %v", v)
+	}
+	if v := mapGet(tg, "timeout"); v == nil || v.Value != "30" || v.Tag != "!!int" {
+		t.Errorf("auxiliary.title_generation.timeout 应原样保留, got %v", v)
+	}
+
+	// auto 辅助：不应被刷新（base_url 仍为空）
+	vis := mapGet(mapGet(doc, "auxiliary"), "vision")
+	if v := mapGet(vis, "provider"); v == nil || v.Value != "auto" {
+		t.Errorf("auxiliary.vision 应仍为 auto, got %v", v)
+	}
+	if v := mapGet(vis, "base_url"); v == nil || v.Value != "" {
+		t.Errorf("auto 的 vision.base_url 不应被写入, got %v", v)
+	}
+
+	// 从不存在的辅助任务不应被新建
+	if mapGet(mapGet(doc, "auxiliary"), "curator") != nil {
+		t.Errorf("未配置的 auxiliary.curator 不应被新建")
+	}
+}
+
+// 清除所有配置时，custom_providers 条目被删的同时，委派/辅助块也应一并恢复默认（消除悬空引用）。
+func TestClearToolConfigResetsMultiModel(t *testing.T) {
+	tmp := isolateHome(t)
+	orig := `model:
+  default: gpt-5.5
+  provider: custom:cfgx
+  base_url: https://x.example.com/v1
+  api_key: sk-xxx
+custom_providers:
+- name: cfgx
+  base_url: https://x.example.com/v1
+  api_key: sk-xxx
+delegation:
+  model: deepseek-v4-flash
+  provider: custom:cfgx
+  base_url: https://x.example.com/v1
+  api_key: sk-xxx
+  max_iterations: 50
+auxiliary:
+  title_generation:
+    provider: custom:cfgx
+    model: kimi-k2.7-code
+    base_url: https://x.example.com/v1
+    api_key: sk-xxx
+`
+	cfgPath := filepath.Join(tmp, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(orig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := clearToolConfig(cfgPath, []string{"https://x.example.com/v1"}); err != nil {
+		t.Fatal(err)
+	}
+	_, doc, err := loadConfigDoc(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// model 块与 custom:cfgx 条目都应没了（否则委派指向它就是悬空）
+	if mapGet(doc, "model") != nil {
+		t.Errorf("model 块应被清除")
+	}
+	if mapGet(doc, "custom_providers") != nil {
+		t.Errorf("唯一的 custom_providers 条目被删后该键应一并移除")
+	}
+
+	// 委派与辅助应已恢复默认，不再指向被删的 custom:cfgx
+	d := mapGet(doc, "delegation")
+	if v := mapGet(d, "model"); v == nil || v.Value != "" {
+		t.Errorf("clearToolConfig 后 delegation.model 应清空, got %v", v)
+	}
+	if v := mapGet(d, "provider"); v == nil || v.Value != "" {
+		t.Errorf("clearToolConfig 后 delegation.provider 应清空, got %v", v)
+	}
+	tg := mapGet(mapGet(doc, "auxiliary"), "title_generation")
+	if v := mapGet(tg, "provider"); v == nil || v.Value != "auto" {
+		t.Errorf("clearToolConfig 后 auxiliary.title_generation 应回 auto, got %v", v)
+	}
+	if v := mapGet(tg, "model"); v == nil || v.Value != "" {
+		t.Errorf("clearToolConfig 后 auxiliary.title_generation.model 应清空, got %v", v)
+	}
+}

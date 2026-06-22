@@ -9,7 +9,7 @@ import (
 
 // 发布前需同步修改的版本号（见 CLAUDE.md）：本常量不带 v 前缀。
 const (
-	appVersion         = "1.0.4"
+	appVersion         = "1.1.0"
 	appName            = "DMXAPI Hermes 配置工具"
 	recommendedBaseURL = "https://www.dmxapi.cn/v1"
 	tokenURL           = "https://www.dmxapi.cn/token"
@@ -522,6 +522,8 @@ func applyAndReport(configPath string, p Profile) {
 		printError("未找到 Hermes 配置文件，无法写入。")
 		return
 	}
+	// 应用前先看有无已启用的委派/辅助块——应用会把它们刷新到这套配置的地址与密钥，成功后给出提示。
+	multiInUse := multiModelInUse(configPath)
 	backup, err := applyProfileToConfig(configPath, p)
 	if err != nil {
 		printError("写入 Hermes 配置失败：" + err.Error())
@@ -531,6 +533,9 @@ func applyAndReport(configPath string, p Profile) {
 	printInfo("已备份原配置：" + backup)
 	printInfo("下次运行 hermes 即生效（无需重启）。")
 	printInfo("Hermes 的 /model 现在会显示这套配置的精选模型（含你的自定义模型）。")
+	if multiInUse {
+		printInfo("已同步委派/辅助模型到新配置的地址与密钥（模型名保留）。")
+	}
 	printTip("若 Hermes 正开着，重开会话或运行 hermes model --refresh 刷新模型列表。")
 }
 
@@ -539,7 +544,7 @@ func clearConfigFlow(configPath string) {
 	clearScreen()
 	printSectionHeader("清除配置")
 	idx := selectMenu("请选择清除方式：", []menuItem{
-		{Label: "清除当前配置", Desc: "仅清除当前生效配置，保留已保存配置（用于切换/登录订阅账号）"},
+		{Label: "清除当前配置", Desc: "仅清除当前生效配置，保留已保存配置"},
 		{Label: "清除所有配置", Desc: "删除全部命名配置 + 清除 Hermes 配置"},
 		{Label: "清除用户新增配置", Desc: "选择并删除某个已保存的命名配置"},
 	})
@@ -610,6 +615,7 @@ func clearAllFlow(configPath string) {
 		} else {
 			printSuccess("已清除 Hermes 配置（model 块 + 本工具的 custom_providers 条目）。")
 			printInfo("已备份原配置：" + backup)
+			printInfo("委派/辅助模型块也已一并恢复默认（避免悬空指向已删除的 provider）。")
 		}
 	} else {
 		printWarning("未找到 Hermes 配置文件，跳过清除 Hermes 配置。")
@@ -803,19 +809,12 @@ func auxiliaryFlow(configPath, provider, baseURL, apiKey string) {
 	}
 }
 
-// resetMultiModel 委派清空 + 全部辅助任务恢复 auto。
+// resetMultiModel 委派清空 + 全部辅助任务恢复 auto（单次原子写，单次备份）。
 func resetMultiModel(configPath string) {
-	if _, err := clearDelegation(configPath); err != nil {
-		printError("清空委派失败：" + err.Error())
+	if _, err := resetMultiModelConfig(configPath); err != nil {
+		printError("恢复默认失败：" + err.Error())
 		waitReturn()
 		return
-	}
-	for _, task := range auxiliaryTasks {
-		if _, err := clearAuxiliaryModel(configPath, task); err != nil {
-			printError("恢复辅助任务 " + task + " 失败：" + err.Error())
-			waitReturn()
-			return
-		}
 	}
 	printSuccess("已把委派与全部辅助任务恢复默认。")
 	waitReturn()

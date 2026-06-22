@@ -292,6 +292,10 @@ func applyProfileToConfig(configPath string, p Profile) (backupPath string, err 
 	mapSetNode(models, p.Model, modelInner(selCtx)) // 覆盖式写入：在精选中则覆盖，不在则追加
 	mapSetNode(entry, "models", models)
 
+	// 3) 多模型块跟随：把已启用的委派/辅助块刷新到这套配置的 provider/base_url/api_key
+	//    （保留各自模型名）。只动在用的块；无多模型块时为 no-op，不影响其它写入路径。
+	syncMultiModelDoc(doc, "custom:"+pname, p.BaseURL, p.APIKey)
+
 	return writeConfigAtomic(configPath, &root)
 }
 
@@ -379,6 +383,8 @@ func clearToolConfig(configPath string, baseURLs []string) (backupPath string, e
 			mapDelete(doc, "custom_providers")
 		}
 	}
+	// 清除所有配置时，把委派/辅助块一并恢复默认，避免悬空指向被删的 custom provider。
+	resetMultiModelDoc(doc)
 	return writeConfigAtomic(configPath, root)
 }
 
@@ -560,6 +566,108 @@ func clearAuxiliaryModel(configPath, task string) (backupPath string, err error)
 		mapSetScalar(t, k, "")
 	}
 	return writeConfigAtomic(configPath, root)
+}
+
+// ── 多模型块「跟随生效配置 / 整体重置」（切换、清除所有时调用）──
+
+// delegationInUse 报告 delegation 块是否已启用（model 非空）。
+func delegationInUse(d *yaml.Node) bool {
+	if d == nil || d.Kind != yaml.MappingNode {
+		return false
+	}
+	m := mapGet(d, "model")
+	return m != nil && m.Value != ""
+}
+
+// auxTaskInUse 报告某 auxiliary 任务块是否已启用（provider 非空且≠auto 且 model 非空，与 auxiliaryFlow 回显一致）。
+func auxTaskInUse(t *yaml.Node) bool {
+	if t == nil || t.Kind != yaml.MappingNode {
+		return false
+	}
+	prov, model := "", ""
+	if v := mapGet(t, "provider"); v != nil {
+		prov = v.Value
+	}
+	if v := mapGet(t, "model"); v != nil {
+		model = v.Value
+	}
+	return prov != "" && prov != "auto" && model != ""
+}
+
+// syncMultiModelDoc 把「已启用」的委派/辅助块的 provider/base_url/api_key 刷新为传入凭据，
+// 保留各自的 model 及其余字段。不存在或 auto/未启用的块一律不动（无多模型块时为 no-op）。
+// 用于切换/应用配置时让多模型块跟随新生效配置——只写字符串字段，遵守类型铁律。返回刷新的块数。
+func syncMultiModelDoc(doc *yaml.Node, provider, baseURL, apiKey string) (n int) {
+	refresh := func(blk *yaml.Node) {
+		mapSetScalar(blk, "provider", provider)
+		mapSetScalar(blk, "base_url", baseURL)
+		mapSetScalar(blk, "api_key", apiKey)
+	}
+	if d := mapGet(doc, "delegation"); delegationInUse(d) {
+		refresh(d)
+		n++
+	}
+	if aux := mapGet(doc, "auxiliary"); aux != nil && aux.Kind == yaml.MappingNode {
+		for _, task := range auxiliaryTasks {
+			if t := mapGet(aux, task); auxTaskInUse(t) {
+				refresh(t)
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// resetMultiModelDoc 把已存在的委派/辅助块恢复默认：委派字符串字段置空、辅助置 provider:auto+其余空。
+// 只动已存在的块、只写字符串字段，不存在的块不新建。用于清除所有配置时一并重置，消除悬空引用。
+func resetMultiModelDoc(doc *yaml.Node) {
+	if d := mapGet(doc, "delegation"); d != nil && d.Kind == yaml.MappingNode {
+		for _, k := range []string{"model", "provider", "base_url", "api_key", "api_mode"} {
+			mapSetScalar(d, k, "")
+		}
+	}
+	if aux := mapGet(doc, "auxiliary"); aux != nil && aux.Kind == yaml.MappingNode {
+		for _, task := range auxiliaryTasks {
+			t := mapGet(aux, task)
+			if t == nil || t.Kind != yaml.MappingNode {
+				continue
+			}
+			mapSetScalar(t, "provider", "auto")
+			for _, k := range []string{"model", "base_url", "api_key"} {
+				mapSetScalar(t, k, "")
+			}
+		}
+	}
+}
+
+// resetMultiModelConfig 一次性把委派与全部辅助任务恢复默认（单次备份+原子写）。
+// 等价于"清空委派 + 每个辅助任务回 auto"，但只写一次（取代逐个 clearAuxiliaryModel 的多次备份）。
+func resetMultiModelConfig(configPath string) (backupPath string, err error) {
+	root, doc, err := loadConfigDoc(configPath)
+	if err != nil {
+		return "", err
+	}
+	resetMultiModelDoc(doc)
+	return writeConfigAtomic(configPath, root)
+}
+
+// multiModelInUse 报告当前配置是否有「已启用」的委派或辅助块（切换时据此决定是否提示已同步）。
+func multiModelInUse(configPath string) bool {
+	_, doc, err := loadConfigDoc(configPath)
+	if err != nil {
+		return false
+	}
+	if delegationInUse(mapGet(doc, "delegation")) {
+		return true
+	}
+	if aux := mapGet(doc, "auxiliary"); aux != nil && aux.Kind == yaml.MappingNode {
+		for _, task := range auxiliaryTasks {
+			if auxTaskInUse(mapGet(aux, task)) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ── API 校验（OpenAI 兼容）──
