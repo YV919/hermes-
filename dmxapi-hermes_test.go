@@ -88,8 +88,9 @@ display:
 	doc := root.Content[0]
 
 	m := mapGet(doc, "model")
-	if v := mapGet(m, "provider"); v == nil || v.Value != "custom" {
-		t.Errorf("model.provider 应为 custom, got %v", v)
+	wantProvider := "custom:" + providerName(p.Name)
+	if v := mapGet(m, "provider"); v == nil || v.Value != wantProvider {
+		t.Errorf("model.provider 应为 %s, got %v", wantProvider, v)
 	}
 	if v := mapGet(m, "default"); v == nil || v.Value != "deepseek-v4-flash" {
 		t.Errorf("model.default 错误: %v", v)
@@ -145,7 +146,7 @@ display:
 	}
 
 	model, provider, baseURL := readActiveModel(cfgPath)
-	if model != p.Model || provider != "custom" || baseURL != p.BaseURL {
+	if model != p.Model || provider != wantProvider || baseURL != p.BaseURL {
 		t.Errorf("readActiveModel 得到 (%s,%s,%s)", model, provider, baseURL)
 	}
 }

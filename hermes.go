@@ -223,6 +223,10 @@ func applyProfileToConfig(configPath string, p Profile) (backupPath string, err 
 	}
 	doc := root.Content[0]
 
+	// 命名 provider 标识：model.provider 用 custom:<name> 绑定到下面的 custom_providers 条目，
+	// 二者用同一 providerName(p.Name) 保证一致——否则 Hermes 的 /model 会退化成对 base_url 全量发现。
+	pname := providerName(p.Name)
+
 	// 1) 内联活动配置 model: 块（bare-custom，Hermes 官方向导范式）
 	modelNode := mapGet(doc, "model")
 	if modelNode == nil || modelNode.Kind != yaml.MappingNode {
@@ -230,7 +234,7 @@ func applyProfileToConfig(configPath string, p Profile) (backupPath string, err 
 		mapSetNode(doc, "model", modelNode)
 	}
 	mapSetScalar(modelNode, "default", p.Model)
-	mapSetScalar(modelNode, "provider", "custom")
+	mapSetScalar(modelNode, "provider", "custom:"+pname)
 	mapSetScalar(modelNode, "base_url", p.BaseURL)
 	mapSetScalar(modelNode, "api_key", p.APIKey)
 
@@ -254,7 +258,7 @@ func applyProfileToConfig(configPath string, p Profile) (backupPath string, err 
 		entry = &yaml.Node{Kind: yaml.MappingNode}
 		cpNode.Content = append(cpNode.Content, entry)
 	}
-	mapSetScalar(entry, "name", providerName(p.Name))
+	mapSetScalar(entry, "name", pname)
 	mapSetScalar(entry, "base_url", p.BaseURL)
 	mapSetScalar(entry, "api_key", p.APIKey)
 	mapSetScalar(entry, "api_mode", "chat_completions")

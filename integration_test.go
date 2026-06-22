@@ -66,8 +66,9 @@ func TestRealConfigRoundTrip(t *testing.T) {
 	}
 	// 校验活动 model 块
 	m := mapGet(after.Content[0], "model")
-	if v := mapGet(m, "provider"); v == nil || v.Value != "custom" {
-		t.Errorf("model.provider 应为 custom")
+	wantProvider := "custom:" + providerName(p.Name)
+	if v := mapGet(m, "provider"); v == nil || v.Value != wantProvider {
+		t.Errorf("model.provider 应为 %s", wantProvider)
 	}
 	if v := mapGet(m, "default"); v == nil || v.Value != p.Model {
 		t.Errorf("model.default 应为 %s", p.Model)

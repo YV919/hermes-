@@ -9,7 +9,7 @@ import (
 
 // 发布前需同步修改的版本号（见 CLAUDE.md）：本常量不带 v 前缀。
 const (
-	appVersion         = "1.0.1"
+	appVersion         = "1.0.2"
 	appName            = "DMXAPI Hermes 配置工具"
 	recommendedBaseURL = "https://www.dmxapi.cn/v1"
 	tokenURL           = "https://www.dmxapi.cn/token"
@@ -25,16 +25,16 @@ type presetModel struct {
 }
 
 // presetModels 是 DMXAPI 常用对话/编码模型精选清单。
-// 仅收录有来源佐证的模型名（依据 dmxapi.doc 请求体 / 实测），DMXAPI 新增模型时用"自定义输入"兜底。
+// 折扣等描述仅用于显示（Hint），不影响写入配置的模型 ID。DMXAPI 新增模型时用"自定义输入"兜底。
 var presetModels = []presetModel{
-	{"deepseek-v4-flash", "深度求索 · 快速便宜"},
+	{"claude-opus-4-8-cc", "Claude Opus · 3.4 折"},
+	{"claude-opus-4-8", "Claude Opus · 6.8 折"},
+	{"claude-opus-4-8-ssvip", "Claude Opus · SSVIP"},
+	{"gpt-5.5", "OpenAI · 6.8 折"},
 	{"deepseek-v4-pro", "深度求索 · 思考主推"},
-	{"claude-sonnet-4-6", "Claude · 均衡"},
-	{"claude-opus-4-7", "Claude · 最强"},
-	{"gpt-5.4", "OpenAI · 新版"},
-	{"gpt-5.2", "OpenAI"},
-	{"gpt-5.1", "OpenAI"},
-	{"gpt-5-mini", "OpenAI · 轻量"},
+	{"deepseek-v4-flash", "深度求索 · 快速便宜"},
+	{"glm-5.2", "智谱 GLM"},
+	{"kimi-k2.7-code", "Kimi · 编码"},
 }
 
 type action int
