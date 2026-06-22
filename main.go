@@ -9,7 +9,7 @@ import (
 
 // 发布前需同步修改的版本号（见 CLAUDE.md）：本常量不带 v 前缀。
 const (
-	appVersion         = "1.1.0"
+	appVersion         = "1.1.1"
 	appName            = "DMXAPI Hermes 配置工具"
 	recommendedBaseURL = "https://www.dmxapi.cn/v1"
 	tokenURL           = "https://www.dmxapi.cn/token"
@@ -228,12 +228,16 @@ func runSteps(steps []func() stepResult) {
 func addConfigFlow(configPath string, recommended bool) {
 	var p Profile
 
-	// 收尾步：校验 → 保存 → 是否应用。两分支共用。
+	// 收尾步：校验 → （推荐：直接生效；普通：保存→是否应用）。两分支共用。
 	finish := func() stepResult {
 		printInfo("正在校验密钥与模型...")
 		if err := validateChat(p.BaseURL, p.APIKey, p.Model); err != nil {
 			printWarning("校验未通过：" + err.Error())
-			yes, esc := styledConfirm("仍然保存此配置吗？", false)
+			verb := "保存"
+			if recommended {
+				verb = "应用"
+			}
+			yes, esc := styledConfirm("仍然"+verb+"此配置吗？", false)
 			if esc {
 				return stepBack // 回上一步改正
 			}
@@ -243,6 +247,20 @@ func addConfigFlow(configPath string, recommended bool) {
 		} else {
 			printSuccess("校验通过：密钥有效、模型可用 ✔")
 		}
+
+		// 推荐配置：不落地为命名配置，直接应用生效（避免主菜单多出一条配置行）；
+		// 并清掉旧版本可能遗留的同名命名配置，让那条旧行也消失。
+		if recommended {
+			applyAndReport(configPath, p)
+			if _, err := loadProfile(recommendedProfileName); err == nil {
+				if err := deleteProfile(recommendedProfileName); err == nil {
+					printInfo("已移除旧的「" + recommendedProfileName + "」命名配置（推荐配置只生效、不再单独保存）。")
+				}
+			}
+			waitReturn()
+			return stepExit
+		}
+
 		if err := saveProfile(p); err != nil {
 			printError("保存失败：" + err.Error())
 			waitReturn()
@@ -547,6 +565,7 @@ func clearConfigFlow(configPath string) {
 		{Label: "清除当前配置", Desc: "仅清除当前生效配置，保留已保存配置"},
 		{Label: "清除所有配置", Desc: "删除全部命名配置 + 清除 Hermes 配置"},
 		{Label: "清除用户新增配置", Desc: "选择并删除某个已保存的命名配置"},
+		{Label: "↩ 返回主菜单", Desc: "回到上一级主菜单（等同 ESC）"},
 	})
 	switch idx {
 	case 0:
@@ -555,6 +574,8 @@ func clearConfigFlow(configPath string) {
 		clearAllFlow(configPath)
 	case 2:
 		clearOneProfileFlow()
+	case 3: // 返回主菜单（与 ESC 等价）
+		return
 	default: // ESC：返回主菜单
 		return
 	}
