@@ -9,7 +9,7 @@ import (
 
 // 发布前需同步修改的版本号（见 CLAUDE.md）：本常量不带 v 前缀。
 const (
-	appVersion         = "1.0.3"
+	appVersion         = "1.0.4"
 	appName            = "DMXAPI Hermes 配置工具"
 	recommendedBaseURL = "https://www.dmxapi.cn/v1"
 	tokenURL           = "https://www.dmxapi.cn/token"
@@ -57,6 +57,7 @@ const (
 	actRecommend
 	actCheck
 	actClear
+	actMulti
 	actQuit
 )
 
@@ -91,6 +92,7 @@ func main() {
 		}
 		add("➕ 新增配置", "填 base_url / 密钥 / 模型 / 上下文窗口", actAdd, Profile{})
 		add("🩺 环境自检", "检查 Hermes 能否运行", actCheck, Profile{})
+		add("🤝 多模型协作", "配置委派/辅助模型（需先有生效配置）", actMulti, Profile{})
 		add("🧹 清除配置", "清除当前生效 / 全部配置 / 某个已保存配置", actClear, Profile{})
 		add("退出", "", actQuit, Profile{})
 
@@ -107,6 +109,8 @@ func main() {
 			addConfigFlow(configPath, true)
 		case actCheck:
 			envSelfCheck()
+		case actMulti:
+			multiModelFlow(configPath)
 		case actClear:
 			clearConfigFlow(configPath)
 		case actQuit:
@@ -648,6 +652,172 @@ func clearOneProfileFlow() {
 	} else {
 		printSuccess("已删除：" + p.Name)
 	}
+	waitReturn()
+}
+
+// multiModelFlow 多模型协作子菜单：配置委派模型 / 辅助模型 / 全部恢复默认。
+// 复用当前生效配置的 provider/base_url/api_key——无生效配置则提示先应用。
+func multiModelFlow(configPath string) {
+	clearScreen()
+	if configPath == "" {
+		printError("未找到 Hermes 配置文件。")
+		waitReturn()
+		return
+	}
+	provider, baseURL, apiKey := readActiveCreds(configPath)
+	if baseURL == "" || apiKey == "" {
+		printSectionHeader("多模型协作")
+		printWarning("尚无生效配置。委派/辅助模型需复用当前生效配置的地址与密钥。")
+		printInfo("请先在主菜单「应用此配置」或用推荐配置生效一套，再回来配置。")
+		waitReturn()
+		return
+	}
+	for {
+		clearScreen()
+		printSectionHeader("多模型协作")
+		printInfo("委派/辅助模型将复用当前生效配置：" + hostOf(baseURL))
+		printTip("委派=主模型把子任务派给另一个模型并行干；辅助=起标题/压缩/看图等杂活交给便宜模型。")
+		idx := selectMenu("请选择：", []menuItem{
+			{Label: "🧩 配置委派模型", Desc: "delegation：子任务用的模型"},
+			{Label: "🛠️  配置辅助模型", Desc: "11 个辅助任务逐个指定"},
+			{Label: "♻️  全部恢复默认", Desc: "委派清空 + 辅助全部回 auto"},
+		})
+		switch idx {
+		case 0:
+			delegationFlow(configPath, provider, baseURL, apiKey)
+		case 1:
+			auxiliaryFlow(configPath, provider, baseURL, apiKey)
+		case 2:
+			if !confirmYes("确定把委派与全部辅助任务恢复默认吗？") {
+				continue
+			}
+			resetMultiModel(configPath)
+		default: // ESC
+			return
+		}
+	}
+}
+
+// confirmYes 是 styledConfirm 的薄封装（默认否；ESC 与否都返回 false）。
+func confirmYes(label string) bool {
+	yes, esc := styledConfirm(label, false)
+	return yes && !esc
+}
+
+// delegationFlow 配置委派模型：选模型 → 写入 delegation 块（或恢复默认）。
+func delegationFlow(configPath, provider, baseURL, apiKey string) {
+	clearScreen()
+	printSectionHeader("配置委派模型")
+	cur := readDelegationModel(configPath)
+	if cur == "" {
+		fmt.Println("  当前：未启用（用主模型）")
+	} else {
+		fmt.Println("  当前：" + cur)
+	}
+	idx := selectMenu("委派模型：", []menuItem{
+		{Label: "选择模型", Desc: "为子任务指定一个模型"},
+		{Label: "恢复默认（用主模型）", Desc: "清空委派"},
+	})
+	switch idx {
+	case 0:
+		m := pickModel()
+		if m == "" {
+			return
+		}
+		backup, err := setDelegationModel(configPath, m, provider, baseURL, apiKey)
+		if err != nil {
+			printError("写入失败：" + err.Error())
+			waitReturn()
+			return
+		}
+		printSuccess("委派模型已设为：" + m)
+		printInfo("已备份原配置：" + backup)
+		printTip("下次运行 hermes 生效；委派由主模型按任务复杂度自动触发。")
+		waitReturn()
+	case 1:
+		backup, err := clearDelegation(configPath)
+		if err != nil {
+			printError("操作失败：" + err.Error())
+			waitReturn()
+			return
+		}
+		printSuccess("已恢复委派为默认（用主模型）。")
+		printInfo("已备份原配置：" + backup)
+		waitReturn()
+	default: // ESC
+		return
+	}
+}
+
+// auxiliaryFlow 配置辅助模型：列 11 个任务，逐个选模型或恢复 auto。循环可继续配，ESC 返回。
+func auxiliaryFlow(configPath, provider, baseURL, apiKey string) {
+	for {
+		clearScreen()
+		printSectionHeader("配置辅助模型")
+		printTip("auto = 用主模型；可为各杂活指定更便宜/更快的模型。")
+		items := make([]menuItem, 0, len(auxiliaryTasks))
+		for _, task := range auxiliaryTasks {
+			prov, model := readAuxiliaryModel(configPath, task)
+			desc := "auto（用主模型）"
+			if prov != "" && prov != "auto" && model != "" {
+				desc = model
+			}
+			items = append(items, menuItem{Label: task, Desc: desc})
+		}
+		idx := selectMenu("选择辅助任务：", items)
+		if idx < 0 {
+			return
+		}
+		task := auxiliaryTasks[idx]
+
+		clearScreen()
+		printSectionHeader("辅助任务：" + task)
+		sub := selectMenu("为「"+task+"」：", []menuItem{
+			{Label: "选择模型", Desc: "指定该任务用的模型"},
+			{Label: "恢复 auto（用主模型）", Desc: "清空该任务的模型"},
+		})
+		switch sub {
+		case 0:
+			m := pickModel()
+			if m == "" {
+				continue
+			}
+			if _, err := setAuxiliaryModel(configPath, task, m, provider, baseURL, apiKey); err != nil {
+				printError("写入失败：" + err.Error())
+				waitReturn()
+				continue
+			}
+			printSuccess(task + " 已设为：" + m)
+			waitReturn()
+		case 1:
+			if _, err := clearAuxiliaryModel(configPath, task); err != nil {
+				printError("操作失败：" + err.Error())
+				waitReturn()
+				continue
+			}
+			printSuccess(task + " 已恢复 auto。")
+			waitReturn()
+		default: // ESC：回到任务列表
+			continue
+		}
+	}
+}
+
+// resetMultiModel 委派清空 + 全部辅助任务恢复 auto。
+func resetMultiModel(configPath string) {
+	if _, err := clearDelegation(configPath); err != nil {
+		printError("清空委派失败：" + err.Error())
+		waitReturn()
+		return
+	}
+	for _, task := range auxiliaryTasks {
+		if _, err := clearAuxiliaryModel(configPath, task); err != nil {
+			printError("恢复辅助任务 " + task + " 失败：" + err.Error())
+			waitReturn()
+			return
+		}
+	}
+	printSuccess("已把委派与全部辅助任务恢复默认。")
 	waitReturn()
 }
 

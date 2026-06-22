@@ -377,3 +377,157 @@ display:
 		t.Errorf("无关的 display 设置丢失了")
 	}
 }
+
+// 多模型协作：委派模型写入正确，且 delegation 其它字段（max_iterations 等）保留。
+func TestSetDelegationModel(t *testing.T) {
+	tmp := isolateHome(t)
+	orig := `model:
+  default: gpt-5.5
+  provider: custom:dmxapi
+delegation:
+  model: ''
+  provider: ''
+  base_url: ''
+  api_key: ''
+  max_iterations: 50
+  orchestrator_enabled: true
+display:
+  personality: kawaii
+`
+	cfgPath := filepath.Join(tmp, "config.yaml")
+	os.WriteFile(cfgPath, []byte(orig), 0o600)
+	if _, err := setDelegationModel(cfgPath, "deepseek-v4-flash", "custom:dmxapi", "https://www.dmxapi.cn/v1", "sk-x"); err != nil {
+		t.Fatal(err)
+	}
+	_, doc, err := loadConfigDoc(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := mapGet(doc, "delegation")
+	if v := mapGet(d, "model"); v == nil || v.Value != "deepseek-v4-flash" {
+		t.Errorf("delegation.model 错误: %v", v)
+	}
+	if v := mapGet(d, "provider"); v == nil || v.Value != "custom:dmxapi" {
+		t.Errorf("delegation.provider 错误: %v", v)
+	}
+	if v := mapGet(d, "base_url"); v == nil || v.Value != "https://www.dmxapi.cn/v1" {
+		t.Errorf("delegation.base_url 错误: %v", v)
+	}
+	if v := mapGet(d, "api_key"); v == nil || v.Value != "sk-x" {
+		t.Errorf("delegation.api_key 错误: %v", v)
+	}
+	// 未触碰的字段必须保留（含类型）
+	if v := mapGet(d, "max_iterations"); v == nil || v.Value != "50" || v.Tag != "!!int" {
+		t.Errorf("max_iterations 应保留为 int 50, got %v", v)
+	}
+	if v := mapGet(d, "orchestrator_enabled"); v == nil || v.Value != "true" || v.Tag != "!!bool" {
+		t.Errorf("orchestrator_enabled 应保留为 bool true, got %v", v)
+	}
+	if mapGet(doc, "display") == nil {
+		t.Errorf("无关的 display 设置丢失了")
+	}
+
+	// clearDelegation 应清空字符串字段、保留 max_iterations
+	if _, err := clearDelegation(cfgPath); err != nil {
+		t.Fatal(err)
+	}
+	_, doc2, _ := loadConfigDoc(cfgPath)
+	d2 := mapGet(doc2, "delegation")
+	if v := mapGet(d2, "model"); v == nil || v.Value != "" {
+		t.Errorf("clearDelegation 后 model 应为空, got %v", v)
+	}
+	if v := mapGet(d2, "max_iterations"); v == nil || v.Value != "50" {
+		t.Errorf("clearDelegation 不应动 max_iterations, got %v", v)
+	}
+}
+
+// 多模型协作：辅助任务写入正确、timeout 保留；clearAuxiliaryModel 恢复 auto。
+func TestSetAuxiliaryModel(t *testing.T) {
+	tmp := isolateHome(t)
+	orig := `model:
+  default: gpt-5.5
+  provider: custom:dmxapi
+auxiliary:
+  title_generation:
+    provider: auto
+    model: ''
+    base_url: ''
+    api_key: ''
+    timeout: 30
+    extra_body: {}
+`
+	cfgPath := filepath.Join(tmp, "config.yaml")
+	os.WriteFile(cfgPath, []byte(orig), 0o600)
+	if _, err := setAuxiliaryModel(cfgPath, "title_generation", "deepseek-v4-flash", "custom:dmxapi", "https://www.dmxapi.cn/v1", "sk-x"); err != nil {
+		t.Fatal(err)
+	}
+	_, doc, _ := loadConfigDoc(cfgPath)
+	tg := mapGet(mapGet(doc, "auxiliary"), "title_generation")
+	if v := mapGet(tg, "model"); v == nil || v.Value != "deepseek-v4-flash" {
+		t.Errorf("auxiliary.title_generation.model 错误: %v", v)
+	}
+	if v := mapGet(tg, "provider"); v == nil || v.Value != "custom:dmxapi" {
+		t.Errorf("auxiliary.title_generation.provider 错误: %v", v)
+	}
+	if v := mapGet(tg, "base_url"); v == nil || v.Value != "https://www.dmxapi.cn/v1" {
+		t.Errorf("auxiliary.title_generation.base_url 错误: %v", v)
+	}
+	// timeout 必须保留为 int 30
+	if v := mapGet(tg, "timeout"); v == nil || v.Value != "30" || v.Tag != "!!int" {
+		t.Errorf("timeout 应保留为 int 30, got %v", v)
+	}
+
+	// clearAuxiliaryModel：provider=auto、model=''
+	if _, err := clearAuxiliaryModel(cfgPath, "title_generation"); err != nil {
+		t.Fatal(err)
+	}
+	_, doc2, _ := loadConfigDoc(cfgPath)
+	tg2 := mapGet(mapGet(doc2, "auxiliary"), "title_generation")
+	if v := mapGet(tg2, "provider"); v == nil || v.Value != "auto" {
+		t.Errorf("clearAuxiliaryModel 后 provider 应为 auto, got %v", v)
+	}
+	if v := mapGet(tg2, "model"); v == nil || v.Value != "" {
+		t.Errorf("clearAuxiliaryModel 后 model 应为空, got %v", v)
+	}
+	if v := mapGet(tg2, "timeout"); v == nil || v.Value != "30" {
+		t.Errorf("clearAuxiliaryModel 不应动 timeout, got %v", v)
+	}
+}
+
+// readActiveCreds 从 model 块读出 provider/base_url/api_key。
+func TestReadActiveCreds(t *testing.T) {
+	tmp := isolateHome(t)
+	cfgPath := filepath.Join(tmp, "config.yaml")
+	os.WriteFile(cfgPath, []byte("model:\n  provider: custom:dmxapi\n  base_url: https://www.dmxapi.cn/v1\n  api_key: sk-z\n"), 0o600)
+	prov, bu, key := readActiveCreds(cfgPath)
+	if prov != "custom:dmxapi" || bu != "https://www.dmxapi.cn/v1" || key != "sk-z" {
+		t.Errorf("readActiveCreds 得到 (%s,%s,%s)", prov, bu, key)
+	}
+}
+
+// setAuxiliaryModel 在 auxiliary / 该 task 块都不存在时应自动新建（不硬编码 timeout）。
+func TestSetAuxiliaryModelCreatesMissingBlock(t *testing.T) {
+	tmp := isolateHome(t)
+	cfgPath := filepath.Join(tmp, "config.yaml")
+	// 配置里完全没有 auxiliary 块
+	os.WriteFile(cfgPath, []byte("model:\n  provider: custom:dmxapi\n  base_url: https://www.dmxapi.cn/v1\n  api_key: sk-z\n"), 0o600)
+	if _, err := setAuxiliaryModel(cfgPath, "vision", "deepseek-v4-flash", "custom:dmxapi", "https://www.dmxapi.cn/v1", "sk-z"); err != nil {
+		t.Fatal(err)
+	}
+	_, doc, _ := loadConfigDoc(cfgPath)
+	aux := mapGet(doc, "auxiliary")
+	if aux == nil {
+		t.Fatal("auxiliary 块未被新建")
+	}
+	v := mapGet(aux, "vision")
+	if v == nil {
+		t.Fatal("auxiliary.vision 块未被新建")
+	}
+	if m := mapGet(v, "model"); m == nil || m.Value != "deepseek-v4-flash" {
+		t.Errorf("新建块 model 错误: %v", m)
+	}
+	// 不应硬编码 timeout
+	if to := mapGet(v, "timeout"); to != nil {
+		t.Errorf("新建块不应写 timeout, got %v", to.Value)
+	}
+}

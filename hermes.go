@@ -425,10 +425,146 @@ func readActiveModel(configPath string) (model, provider, baseURL string) {
 	return
 }
 
+// ── 多模型协作：委派 delegation + 辅助 auxiliary ──
+
+// auxiliaryTasks 是 Hermes 的 11 个辅助任务名（顺序与 config.yaml 一致）。
+var auxiliaryTasks = []string{
+	"vision", "web_extract", "compression", "skills_hub", "approval", "mcp",
+	"title_generation", "triage_specifier", "kanban_decomposer", "profile_describer", "curator",
+}
+
+// readActiveCreds 读取当前生效 model: 块的 provider/base_url/api_key（委派/辅助复用这套凭据）。
+// 三者任一为空表示尚无可用的生效配置。
+func readActiveCreds(configPath string) (provider, baseURL, apiKey string) {
+	_, doc, err := loadConfigDoc(configPath)
+	if err != nil {
+		return
+	}
+	m := mapGet(doc, "model")
+	if m == nil {
+		return
+	}
+	if v := mapGet(m, "provider"); v != nil {
+		provider = v.Value
+	}
+	if v := mapGet(m, "base_url"); v != nil {
+		baseURL = v.Value
+	}
+	if v := mapGet(m, "api_key"); v != nil {
+		apiKey = v.Value
+	}
+	return
+}
+
+// ensureMap 确保 doc 下 key 是映射节点，返回它（缺则新建）。
+func ensureMap(doc *yaml.Node, key string) *yaml.Node {
+	n := mapGet(doc, key)
+	if n == nil || n.Kind != yaml.MappingNode {
+		n = &yaml.Node{Kind: yaml.MappingNode}
+		mapSetNode(doc, key, n)
+	}
+	return n
+}
+
+// readDelegationModel 读取当前 delegation.model（用于菜单回显）。
+func readDelegationModel(configPath string) string {
+	_, doc, err := loadConfigDoc(configPath)
+	if err != nil {
+		return ""
+	}
+	if d := mapGet(doc, "delegation"); d != nil {
+		if v := mapGet(d, "model"); v != nil {
+			return v.Value
+		}
+	}
+	return ""
+}
+
+// setDelegationModel 把委派模型写进 delegation 块（provider/base_url/api_key 复用当前生效配置）。
+// 只 upsert 这四个字符串字段，max_iterations 等其余字段保持原值。备份后原子写入。
+func setDelegationModel(configPath, model, provider, baseURL, apiKey string) (backupPath string, err error) {
+	root, doc, err := loadConfigDoc(configPath)
+	if err != nil {
+		return "", err
+	}
+	d := ensureMap(doc, "delegation")
+	mapSetScalar(d, "model", model)
+	mapSetScalar(d, "provider", provider)
+	mapSetScalar(d, "base_url", baseURL)
+	mapSetScalar(d, "api_key", apiKey)
+	return writeConfigAtomic(configPath, root)
+}
+
+// clearDelegation 清空委派（恢复"用主模型"）：model/provider/base_url/api_key/api_mode 置空，保留其余字段。
+func clearDelegation(configPath string) (backupPath string, err error) {
+	root, doc, err := loadConfigDoc(configPath)
+	if err != nil {
+		return "", err
+	}
+	d := ensureMap(doc, "delegation")
+	for _, k := range []string{"model", "provider", "base_url", "api_key", "api_mode"} {
+		mapSetScalar(d, k, "")
+	}
+	return writeConfigAtomic(configPath, root)
+}
+
+// readAuxiliaryModel 读取某辅助任务当前的 provider/model（用于菜单回显）。
+func readAuxiliaryModel(configPath, task string) (provider, model string) {
+	_, doc, err := loadConfigDoc(configPath)
+	if err != nil {
+		return
+	}
+	aux := mapGet(doc, "auxiliary")
+	if aux == nil {
+		return
+	}
+	t := mapGet(aux, task)
+	if t == nil {
+		return
+	}
+	if v := mapGet(t, "provider"); v != nil {
+		provider = v.Value
+	}
+	if v := mapGet(t, "model"); v != nil {
+		model = v.Value
+	}
+	return
+}
+
+// setAuxiliaryModel 给某辅助任务指定模型（provider/base_url/api_key 复用当前生效配置）。
+// 只 upsert 这四个字符串字段，timeout/extra_body/download_timeout 等保持原值；缺 task 块则新建最小块（不硬编码 timeout）。
+func setAuxiliaryModel(configPath, task, model, provider, baseURL, apiKey string) (backupPath string, err error) {
+	root, doc, err := loadConfigDoc(configPath)
+	if err != nil {
+		return "", err
+	}
+	aux := ensureMap(doc, "auxiliary")
+	t := ensureMap(aux, task)
+	mapSetScalar(t, "provider", provider)
+	mapSetScalar(t, "model", model)
+	mapSetScalar(t, "base_url", baseURL)
+	mapSetScalar(t, "api_key", apiKey)
+	return writeConfigAtomic(configPath, root)
+}
+
+// clearAuxiliaryModel 把某辅助任务恢复为用主模型：provider=auto、model/base_url/api_key 置空。
+func clearAuxiliaryModel(configPath, task string) (backupPath string, err error) {
+	root, doc, err := loadConfigDoc(configPath)
+	if err != nil {
+		return "", err
+	}
+	aux := ensureMap(doc, "auxiliary")
+	t := ensureMap(aux, task)
+	mapSetScalar(t, "provider", "auto")
+	for _, k := range []string{"model", "base_url", "api_key"} {
+		mapSetScalar(t, k, "")
+	}
+	return writeConfigAtomic(configPath, root)
+}
+
 // ── API 校验（OpenAI 兼容）──
 
 func httpClient() *http.Client { return &http.Client{Timeout: 30 * time.Second} }
-
 // validateChat 用真实模型发一条最小请求做端到端冒烟。区分鉴权失败 vs 模型名问题。
 func validateChat(baseURL, apiKey, model string) error {
 	payload := map[string]interface{}{
