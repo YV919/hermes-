@@ -1,0 +1,162 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      # 生成 Changelog
+      - name: Generate Changelog
+        id: changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          GITHUB_REPO: ${{ github.repository }}
+
+      - name: Build binaries
+        run: |
+          VERSION=${{ github.ref_name }}
+
+          # Windows AMD64
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o dmxapi-hermes-${VERSION}-windows-amd64.exe .
+
+          # Linux AMD64
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o dmxapi-hermes-${VERSION}-linux-amd64 .
+
+          # Linux ARM64
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o dmxapi-hermes-${VERSION}-linux-arm64 .
+
+          # macOS AMD64
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o dmxapi-hermes-${VERSION}-macos-amd64 .
+
+          # macOS ARM64
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o dmxapi-hermes-${VERSION}-macos-arm64 .
+
+      # 创建增强的 Release
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: DMXAPI Hermes ${{ github.ref_name }}
+          body: |
+            ## DMXAPI Hermes 配置工具 ${{ github.ref_name }}
+
+            一键配置 Hermes Agent (Nous Research) 的跨平台工具，支持多套命名配置与一键切换。
+
+            ---
+
+            ${{ steps.changelog.outputs.content }}
+
+            ---
+
+            ### 📥 下载
+
+            | 平台 | 架构 | 文件 |
+            |------|------|------|
+            | Windows | x64 | `dmxapi-hermes-${{ github.ref_name }}-windows-amd64.exe` |
+            | Linux | x64 | `dmxapi-hermes-${{ github.ref_name }}-linux-amd64` |
+            | Linux | ARM64 | `dmxapi-hermes-${{ github.ref_name }}-linux-arm64` |
+            | macOS | Intel | `dmxapi-hermes-${{ github.ref_name }}-macos-amd64` |
+            | macOS | Apple Silicon (M1/M2/M3/M4) | `dmxapi-hermes-${{ github.ref_name }}-macos-arm64` |
+
+            ---
+
+            ### ⚡ 快速安装（推荐）
+
+            **Linux / macOS**
+            ```bash
+            curl -fsSL https://cnb.cool/dmxapi/dmxapi_hermes/-/git/raw/main/install.sh | bash
+            ```
+
+            **Windows PowerShell**
+            ```powershell
+            iwr -useb https://cnb.cool/dmxapi/dmxapi_hermes/-/git/raw/main/install.ps1 | iex
+            ```
+
+            **Windows CMD**
+            ```cmd
+            curl -fsSL https://cnb.cool/dmxapi/dmxapi_hermes/-/git/raw/main/install.cmd -o "%TEMP%\install.cmd" && call "%TEMP%\install.cmd"
+            ```
+
+            > **Windows 说明**：CMD 方案需要 Windows 10 版本 1803 或更高（内置 curl）。
+
+            ---
+
+            ### 🛠️ 安装说明
+
+            #### Windows x64
+            ```powershell
+            # 下载后直接运行
+            .\dmxapi-hermes-${{ github.ref_name }}-windows-amd64.exe
+            ```
+
+            #### Linux x64 (amd64)
+            ```bash
+            chmod +x dmxapi-hermes-${{ github.ref_name }}-linux-amd64
+            ./dmxapi-hermes-${{ github.ref_name }}-linux-amd64
+            ```
+
+            #### Linux ARM64（树莓派、Graviton 等）
+            ```bash
+            chmod +x dmxapi-hermes-${{ github.ref_name }}-linux-arm64
+            ./dmxapi-hermes-${{ github.ref_name }}-linux-arm64
+            ```
+
+            #### macOS Apple Silicon (M1/M2/M3/M4, arm64)
+            ```bash
+            chmod +x dmxapi-hermes-${{ github.ref_name }}-macos-arm64
+            xattr -cr dmxapi-hermes-${{ github.ref_name }}-macos-arm64
+            ./dmxapi-hermes-${{ github.ref_name }}-macos-arm64
+            ```
+
+            #### macOS Intel (amd64)
+            ```bash
+            chmod +x dmxapi-hermes-${{ github.ref_name }}-macos-amd64
+            xattr -cr dmxapi-hermes-${{ github.ref_name }}-macos-amd64
+            ./dmxapi-hermes-${{ github.ref_name }}-macos-amd64
+            ```
+
+            > **macOS 说明**：`xattr -cr` 用于移除系统对网络下载文件添加的隔离标记，为 macOS 运行未签名可执行文件的必要步骤，请勿跳过。
+
+            ---
+
+            ### ⚙️ 工具做了什么
+
+            本工具直接编辑 Hermes 配置文件 `~/AppData/Local/hermes/config.yaml`，无需设置任何环境变量：
+
+            - 将 `model` 块改写为内联 provider 配置：`provider: custom`、`base_url`、`api_key`、`default`
+            - 在 `custom_providers` 中 upsert 对应条目，承载 `context_length` 等参数
+            - 支持保存多套命名配置，并一键切换当前生效的配置
+
+            > **说明**：改完后下次运行 `hermes` 即自动生效，无需重启终端或重新登录。
+
+            ---
+
+            ### 🔗 相关链接
+
+            - [获取 API Token](https://www.dmxapi.cn/token)
+
+          files: |
+            dmxapi-hermes-${{ github.ref_name }}-windows-amd64.exe
+            dmxapi-hermes-${{ github.ref_name }}-linux-amd64
+            dmxapi-hermes-${{ github.ref_name }}-linux-arm64
+            dmxapi-hermes-${{ github.ref_name }}-macos-amd64
+            dmxapi-hermes-${{ github.ref_name }}-macos-arm64

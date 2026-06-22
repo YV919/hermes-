@@ -1,0 +1,10 @@
+.claude/settings.local.json
+dmxapi-hermes-linux-amd64
+dmxapi-hermes-linux-arm64
+dmxapi-hermes-macos-amd64
+dmxapi-hermes-macos-arm64
+dmxapi-hermes.exe
+dmxapi-hermes.exe~
+dmxapi-hermes
+.worktrees/
+.claude/

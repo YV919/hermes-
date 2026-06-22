@@ -1,0 +1,421 @@
+# ============================================
+# CNB 云原生构建配置
+# ============================================
+
+# 主分支推送 - 同步到 GitHub
+# TODO: 如需把代码自动镜像到 GitHub，取消下面整段注释，并把 target_url 改成你的 GitHub 仓库地址
+# main:
+#   push:
+#     - name: "自动同步到GitHub"
+#       imports: https://cnb.cool/dmxapi/claude-code-my/-/blob/main/env.yml
+#       runner:
+#         tags: cnb:arch:amd64
+#         cpus: 4
+#       stages:
+#         - name: sync to github with rebase
+#           image: tencentcom/git-sync
+#           settings:
+#             target_url: https://github.com/YOUR_NAME/dmxapi-hermes.git
+#             auth_type: https
+#             username: ${GIT_USERNAME}
+#             password: ${GIT_ACCESS_TOKEN}
+#             sync_mode: rebase
+main:
+  pull_request:
+    - name: "AI 代码评审"
+      imports: https://cnb.cool/dmxapi/claude-code-my/-/blob/main/env.yml
+      runner:
+        tags: cnb:arch:amd64
+        cpus: 4
+      stages:
+        - name: code-review
+          image: cnbcool/code-review:latest
+          settings:
+            context: 50
+            verbose: true
+            comment: true
+            max_comments: 50
+            max_files: 150
+            max_diff_size: 200000
+            fail_on_critical: true
+
+# Tag 推送 - 自动发布 Release
+$:
+  tag_push:
+    - imports: https://cnb.cool/dmxapi/claude-code-my/-/blob/main/env.yml
+      runner:
+        tags: cnb:arch:amd64
+        cpus: 4
+      stages:
+        # 0. 先同步 Tag 到 GitHub
+        # TODO: 如需把 tag 同步到 GitHub，取消下面这个阶段的注释，并改成你的 GitHub 仓库地址
+        # - name: sync tag to github
+        #   image: alpine/git
+        #   script:
+        #     - git remote add github https://${GIT_USERNAME}:${GIT_ACCESS_TOKEN}@github.com/YOUR_NAME/dmxapi-hermes.git || true
+        #     - git push github ${CNB_BRANCH} --force
+        # 1. 生成更新日志（使用 git-cliff 支持 commit 自动分类）
+        - name: 生成更新日志
+          image: cnbcool/default-build-env
+          script:
+            - |
+              curl -sSL https://github.com/orhun/git-cliff/releases/download/v2.7.0/git-cliff-2.7.0-x86_64-unknown-linux-gnu.tar.gz | tar xz
+              git fetch --tags origin >&2
+              git fetch origin main >&2
+
+              # 从 main 上 CHANGELOG.md 解析「已写入的最新版本号」（去掉 refs/tags/ 与 v 前缀）
+              LAST_VERSION=$(git show origin/main:CHANGELOG.md 2>/dev/null \
+                | grep -m1 '^## ' | sed -E 's/^## +//; s/ .*//; s#refs/tags/##; s/^v//')
+
+              CLIFF=./git-cliff-2.7.0/git-cliff
+              # 能定位上次版本 tag → 生成「上次版本..本次 tag」区间，补齐其后所有版本；否则回退 --latest
+              if [ -n "$LAST_VERSION" ] && git rev-parse -q --verify "refs/tags/v${LAST_VERSION}" >/dev/null; then
+                echo "区间生成: v${LAST_VERSION}..${CNB_BRANCH}" >&2
+                NOTES=$($CLIFF --config cliff.toml "v${LAST_VERSION}..${CNB_BRANCH}" --strip header)
+              elif [ -n "$LAST_VERSION" ] && git rev-parse -q --verify "refs/tags/${LAST_VERSION}" >/dev/null; then
+                echo "区间生成: ${LAST_VERSION}..${CNB_BRANCH}" >&2
+                NOTES=$($CLIFF --config cliff.toml "${LAST_VERSION}..${CNB_BRANCH}" --strip header)
+              else
+                echo "未能定位上次版本 tag，回退 --latest" >&2
+                NOTES=$($CLIFF --config cliff.toml --latest --strip header)
+              fi
+
+              # 空区间时 git-cliff 会吐占位符「## 未发布版本」（非空，会骗过下游空判断）。
+              # 仅当含真实版本块（## 后跟数字）才输出，否则输出空串让下游跳过回推（重跑幂等）。
+              if echo "$NOTES" | grep -qE '^## [0-9]'; then
+                echo "$NOTES"
+              else
+                echo "区间无新版本（如 CI 对已写入版本重跑），输出空" >&2
+              fi
+          exports:
+            stdout: RELEASE_NOTES
+
+        # 2. AI 润色更新日志（调用 Anthropic API）
+        - name: AI 润色更新日志
+          image: cnbcool/default-build-env
+          script:
+            - |
+              # RELEASE_NOTES 为空（区间无新版本）→ 直接退出，跳过 AI 与回推（重跑幂等）
+              if [ -z "${RELEASE_NOTES}" ]; then
+                echo "RELEASE_NOTES 为空，跳过 AI 润色" >&2
+                exit 0
+              fi
+              # 将 prompt 模板写入临时文件（避免 shell 特殊字符问题）
+              cat > /tmp/ai_prompt.txt << 'PROMPT_EOF'
+              你是一个软件更新日志编辑器。请将以下 git 变更日志改写为面向普通用户的中文更新说明。
+
+              要求：
+              1. 保留版本号和日期
+              2. 用通俗易懂的语言描述每个变更，去掉技术术语
+              3. 保留 emoji 分类图标
+              4. 每条说明控制在一行以内
+              5. 输出必须以 "## " 开头（Markdown 二级标题）
+              6. 只输出改写后的更新日志，不要输出其他内容
+
+              原始变更日志：
+              PROMPT_EOF
+              printf '%s' "${RELEASE_NOTES}" >> /tmp/ai_prompt.txt
+              PROMPT=$(cat /tmp/ai_prompt.txt)
+
+              # 按模型前缀选择不同厂商接口
+              call_ai() {
+                case "${AI_MODEL}" in
+                  claude*)
+                    curl -s -w "\n%{http_code}" "${AI_API_URL}/v1/messages" \
+                      -H "Content-Type: application/json" \
+                      -H "x-api-key: ${AI_API_KEY}" \
+                      -H "anthropic-version: 2023-06-01" \
+                      -d "$(jq -n \
+                        --arg model "${AI_MODEL}" \
+                        --arg prompt "${PROMPT}" \
+                        '{model: $model, max_tokens: 4096, messages: [{role: "user", content: $prompt}]}')"
+                    ;;
+                  gemini*)
+                    curl -s -w "\n%{http_code}" "${AI_API_URL}/v1beta/models/${AI_MODEL}:generateContent?key=${AI_API_KEY}" \
+                      -H "Content-Type: application/json" \
+                      -d "$(jq -n \
+                        --arg prompt "${PROMPT}" \
+                        '{contents: [{parts: [{text: $prompt}]}], generationConfig: {maxOutputTokens: 4096}}')"
+                    ;;
+                  gpt-5*)
+                    curl -s -w "\n%{http_code}" "${AI_API_URL}/v1/responses" \
+                      -H "Content-Type: application/json" \
+                      -H "Authorization: Bearer ${AI_API_KEY}" \
+                      -d "$(jq -n \
+                        --arg model "${AI_MODEL}" \
+                        --arg prompt "${PROMPT}" \
+                        '{model: $model, input: $prompt, max_output_tokens: 4096}')"
+                    ;;
+                  *)
+                    curl -s -w "\n%{http_code}" "${AI_API_URL}/v1/completions" \
+                      -H "Content-Type: application/json" \
+                      -H "Authorization: Bearer ${AI_API_KEY}" \
+                      -d "$(jq -n \
+                        --arg model "${AI_MODEL}" \
+                        --arg prompt "${PROMPT}" \
+                        '{model: $model, prompt: $prompt, max_tokens: 4096}')"
+                    ;;
+                esac
+              }
+
+              extract_ai_text() {
+                case "${AI_MODEL}" in
+                  claude*)
+                    echo "$1" | jq -r '.content[0].text // empty'
+                    ;;
+                  gemini*)
+                    echo "$1" | jq -r '.candidates[0].content.parts[0].text // empty'
+                    ;;
+                  gpt-5*)
+                    echo "$1" | jq -r '[.output[]?.content[]? | select(.type == "output_text") | .text] | join("\n")'
+                    ;;
+                  *)
+                    echo "$1" | jq -r '.choices[0].text // empty'
+                    ;;
+                esac
+              }
+
+              RESPONSE=$(call_ai)
+              HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+              BODY=$(echo "$RESPONSE" | sed '$d')
+
+              # 重试逻辑
+              if [ "$HTTP_CODE" != "200" ]; then
+                echo "AI API 首次调用失败 (HTTP $HTTP_CODE)，3 秒后重试..." >&2
+                sleep 3
+                RESPONSE=$(call_ai)
+                HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+                BODY=$(echo "$RESPONSE" | sed '$d')
+              fi
+
+              # 提取 AI 输出
+              if [ "$HTTP_CODE" = "200" ]; then
+                AI_TEXT=$(extract_ai_text "$BODY")
+                AI_LEN=${#AI_TEXT}
+                # 验证输出格式
+                if echo "$AI_TEXT" | head -1 | grep -q '^## ' && [ "$AI_LEN" -le 10000 ]; then
+                  echo "$AI_TEXT"
+                  exit 0
+                fi
+                echo "AI 输出格式验证失败（长度=${AI_LEN}），使用原始日志" >&2
+              else
+                echo "AI API 调用失败 (HTTP $HTTP_CODE)，使用原始日志" >&2
+              fi
+
+              # 回退：输出原始 RELEASE_NOTES
+              echo "${RELEASE_NOTES}"
+          exports:
+            stdout: AI_RELEASE_NOTES
+
+        # 3. 更新 CHANGELOG.md 并推送回 main
+        - name: 更新 CHANGELOG.md
+          image: cnbcool/default-build-env
+          script:
+            - |
+              # 检查 AI_RELEASE_NOTES 是否为空
+              if [ -z "${AI_RELEASE_NOTES}" ]; then
+                echo "AI_RELEASE_NOTES 为空，跳过 CHANGELOG 更新" >&2
+                exit 0
+              fi
+
+              # 安装 gnupg 并导入用于签名的 GPG 私钥（来自 env.yml 的 GPG_PRIVATE_KEY_B64）
+              # cnb 仓库开启了强制 GPG 签名的推送保护，自动提交必须带有效签名
+              command -v gpg >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq gnupg; }
+              echo "$GPG_PRIVATE_KEY_B64" | base64 -d | gpg --batch --import
+
+              # 签名身份必须与 key 的 uid/邮箱一致，签名才会被识别为 verified
+              git config user.email "yesongyun@foxmail.com"
+              git config user.name "夜松云"
+              git config user.signingkey 02CF5F475FD005EA
+              git config commit.gpgsign true
+              export GPG_TTY=$(tty) || true
+
+              # 基于 origin/main 创建临时分支（避免 detached HEAD 问题）
+              git fetch origin main
+              git checkout -b temp-changelog origin/main
+
+              # 找到第一个 "## " 标题的行号
+              FIRST_HEADING=$(grep -n '^## ' CHANGELOG.md | head -1 | cut -d: -f1)
+
+              if [ -n "$FIRST_HEADING" ]; then
+                # 拆分文件：头部（标题+描述）和正文（各版本内容）
+                head -n $((FIRST_HEADING - 1)) CHANGELOG.md > /tmp/changelog_header.md
+                tail -n +${FIRST_HEADING} CHANGELOG.md > /tmp/changelog_body.md
+
+                # 拼接：头部 + 新内容 + 空行 + 原正文（与 spec 一致）
+                cat /tmp/changelog_header.md > CHANGELOG.md
+                echo "" >> CHANGELOG.md
+                echo "${AI_RELEASE_NOTES}" >> CHANGELOG.md
+                echo "" >> CHANGELOG.md
+                cat /tmp/changelog_body.md >> CHANGELOG.md
+              else
+                # 没有 ## 行，追加到末尾
+                echo "" >> CHANGELOG.md
+                echo "${AI_RELEASE_NOTES}" >> CHANGELOG.md
+              fi
+
+              # 提交并推送临时分支到 main
+              git add CHANGELOG.md
+              git commit -S -m "docs: update CHANGELOG.md for ${CNB_BRANCH}"
+              # 用 CNB 平台内置凭据回推当前仓库
+              # （GIT_USERNAME/GIT_ACCESS_TOKEN 是 GitHub 同步用的凭据，无法鉴权 cnb.cool）
+              ORIGIN_URL=$(git remote get-url origin)
+              PUSH_URL=$(echo "$ORIGIN_URL" | sed "s|https://|https://${CNB_TOKEN_USER_NAME}:${CNB_TOKEN}@|")
+              if ! git push "$PUSH_URL" temp-changelog:main; then
+                echo "推送 CHANGELOG.md 到 main 失败（可能存在并发冲突），跳过本次更新" >&2
+                exit 0
+              fi
+
+        # 4. 编译各平台二进制文件
+        #    注意：上一步「更新 CHANGELOG.md」把工作区切到了 origin/main，
+        #    而 appVersion 是源码里的硬编码常量（未用 ldflags 注入）。
+        #    若直接在此工作区编译，会用 main 的源码 → 产物版本号停留在旧版本。
+        #    因此必须先切回 tag 源码再编译。
+        - name: 切回 tag 源码
+          image: alpine/git
+          script:
+            - git fetch --tags --force origin
+            - git checkout -f "${CNB_BRANCH}"
+            - echo "将编译版本：" && grep 'appVersion ' main.go
+
+        # 本项目是多文件 Go 包，编译当前目录这个包（结尾的 "."），不要写成单文件形式
+        - name: 编译 Windows AMD64
+          image: golang:1.21
+          script:
+            - CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o dmxapi-hermes-${CNB_BRANCH}-windows-amd64.exe .
+
+        - name: 编译 Linux AMD64
+          image: golang:1.21
+          script:
+            - CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o dmxapi-hermes-${CNB_BRANCH}-linux-amd64 .
+
+        - name: 编译 Linux ARM64
+          image: golang:1.21
+          script:
+            - CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o dmxapi-hermes-${CNB_BRANCH}-linux-arm64 .
+
+        - name: 编译 macOS AMD64
+          image: golang:1.21
+          script:
+            - CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o dmxapi-hermes-${CNB_BRANCH}-macos-amd64 .
+
+        - name: 编译 macOS ARM64
+          image: golang:1.21
+          script:
+            - CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o dmxapi-hermes-${CNB_BRANCH}-macos-arm64 .
+
+        # 5. 先创建 Release（必须在上传附件之前）
+        - name: 创建 Release
+          type: git:release
+          options:
+            title: DMXAPI Hermes ${CNB_BRANCH}
+            description: |
+              ## DMXAPI Hermes 配置工具 ${CNB_BRANCH}
+
+              一键配置 Hermes Agent (Nous Research) / DMXAPI 的跨平台工具。
+
+              ---
+
+              ${AI_RELEASE_NOTES}
+
+              ---
+
+              ### 📥 下载
+
+              | 平台 | 架构 | 文件 |
+              |------|------|------|
+              | Windows | x64 | `dmxapi-hermes-${CNB_BRANCH}-windows-amd64.exe` |
+              | Linux | x64 | `dmxapi-hermes-${CNB_BRANCH}-linux-amd64` |
+              | Linux | ARM64 | `dmxapi-hermes-${CNB_BRANCH}-linux-arm64` |
+              | macOS | Intel | `dmxapi-hermes-${CNB_BRANCH}-macos-amd64` |
+              | macOS | Apple Silicon (M1/M2/M3/M4) | `dmxapi-hermes-${CNB_BRANCH}-macos-arm64` |
+
+              ---
+
+              ### ⚡ 快速安装（推荐）
+
+              **Linux / macOS**
+              ```bash
+              curl -fsSL https://cnb.cool/dmxapi/dmxapi_hermes/-/git/raw/main/install.sh | bash
+              ```
+
+              **Windows PowerShell**
+              ```powershell
+              iwr -useb https://cnb.cool/dmxapi/dmxapi_hermes/-/git/raw/main/install.ps1 | iex
+              ```
+
+              **Windows CMD**
+              ```cmd
+              curl -fsSL https://cnb.cool/dmxapi/dmxapi_hermes/-/git/raw/main/install.cmd -o %TEMP%\install.cmd && %TEMP%\install.cmd
+              ```
+
+              ---
+
+              ### 🛠️ 安装说明
+
+              #### Windows x64
+              ```powershell
+              # 下载后直接运行
+              .\dmxapi-hermes-${CNB_BRANCH}-windows-amd64.exe
+              ```
+
+              #### Linux x64 (amd64)
+              ```bash
+              chmod +x dmxapi-hermes-${CNB_BRANCH}-linux-amd64
+              ./dmxapi-hermes-${CNB_BRANCH}-linux-amd64
+              ```
+
+              #### Linux ARM64（树莓派、Graviton 等）
+              ```bash
+              chmod +x dmxapi-hermes-${CNB_BRANCH}-linux-arm64
+              ./dmxapi-hermes-${CNB_BRANCH}-linux-arm64
+              ```
+
+              #### macOS Apple Silicon (M1/M2/M3/M4, arm64)
+              ```bash
+              chmod +x dmxapi-hermes-${CNB_BRANCH}-macos-arm64
+              xattr -cr dmxapi-hermes-${CNB_BRANCH}-macos-arm64
+              ./dmxapi-hermes-${CNB_BRANCH}-macos-arm64
+              ```
+
+              #### macOS Intel (amd64)
+              ```bash
+              chmod +x dmxapi-hermes-${CNB_BRANCH}-macos-amd64
+              xattr -cr dmxapi-hermes-${CNB_BRANCH}-macos-amd64
+              ./dmxapi-hermes-${CNB_BRANCH}-macos-amd64
+              ```
+
+              > **macOS 说明**：`xattr -cr` 用于移除系统对网络下载文件添加的隔离标记，为 macOS 运行未签名可执行文件的必要步骤，请勿跳过。
+
+              ---
+
+              ### 📋 本工具做了什么
+
+              本工具一键配置 Hermes / DMXAPI，无需手动改文件：
+
+              - 编辑 `~/AppData/Local/hermes/config.yaml` 的 `model` 块，写为内联 `provider: custom` + `base_url` + `api_key` + 默认模型；
+              - 同步 upsert `custom_providers` 中对应条目，承载该 provider 的上下文窗口（`context_length`）；
+              - 支持保存多套命名配置，并在它们之间一键切换。
+
+              > 本工具**不写任何环境变量**。配置改完后，**下次运行 Hermes 自动生效**，无需重启终端或 `source`。
+
+              ---
+
+              ### 🔗 相关链接
+
+              - [获取 API Token](https://www.dmxapi.cn/token)
+              - [DMXAPI 官网](https://www.dmxapi.cn/)
+
+        # 6. 再上传附件到已创建的 Release
+        - name: 上传 Release 附件
+          image: cnbcool/attachments
+          settings:
+            attachments:
+              - "./dmxapi-hermes-${CNB_BRANCH}-*"
+            ttl: 0
+        # 7. 清理旧版本，只保留最近3个
+        - name: 清理旧版本
+          image: docker.cnb.cool/cnb/plugins/cnbcool/release-clean:latest
+          settings:
+            filter: "RECENT_N=3"
+            debug: false
