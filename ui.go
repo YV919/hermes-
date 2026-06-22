@@ -277,9 +277,14 @@ func maskKey(s string) string {
 // printConfigSummary 用双线框打印一套配置的摘要（密钥掩码，CJK 宽度感知对齐）。
 func printConfigSummary(p Profile) {
 	type row struct{ label, value, color string }
+	// 有效上下文窗口：模型预设值 > 本配置手填值 > 自动（预设模型固定用预设）。
+	eff := presetContextLength(p.Model)
+	if eff == 0 {
+		eff = p.ContextLength
+	}
 	ctx := "自动"
-	if p.ContextLength > 0 {
-		ctx = fmt.Sprintf("%d", p.ContextLength)
+	if eff > 0 {
+		ctx = fmt.Sprintf("%d", eff)
 	}
 	rows := []row{
 		{"配置名称", p.Name, cBold + cCyan},

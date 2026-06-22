@@ -131,8 +131,9 @@ display:
 	if inner == nil {
 		t.Fatalf("models[%s] 缺失", p.Model)
 	}
-	if cl := mapGet(inner, "context_length"); cl == nil || cl.Value != "131072" {
-		t.Errorf("context_length 错误: %v", cl)
+	// deepseek-v4-flash 是预设模型 → 预设值 1000000 胜过手填的 131072
+	if cl := mapGet(inner, "context_length"); cl == nil || cl.Value != "1000000" {
+		t.Errorf("预设模型 context_length 应为预设值 1000000, got %v", cl)
 	}
 	// 8 个精选 key 全在
 	for _, pm := range presetModels {
@@ -199,6 +200,60 @@ func TestContextLengthOmittedWhenZero(t *testing.T) {
 	}
 	if cl := mapGet(inner, "context_length"); cl != nil {
 		t.Errorf("ContextLength=0 时不应写 context_length, got %v", cl.Value)
+	}
+}
+
+// 预设模型应把各自的 context_length 写进 models（未选中的也带），选中且未手填则用预设值。
+func TestPresetContextLengthWritten(t *testing.T) {
+	tmp := isolateHome(t)
+	cfgPath := filepath.Join(tmp, "config.yaml")
+	os.WriteFile(cfgPath, []byte("model:\n  default: x\n  provider: custom\n"), 0o600)
+	// 选中 kimi-k2.7-code、不手填 context（ContextLength=0）→ 应取预设 256000
+	p := Profile{Name: "n", BaseURL: "https://www.dmxapi.cn/v1", APIKey: "sk-a", Model: "kimi-k2.7-code", ContextLength: 0}
+	if _, err := applyProfileToConfig(cfgPath, p); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(cfgPath)
+	var root yaml.Node
+	yaml.Unmarshal(data, &root)
+	models := mapGet(mapGet(root.Content[0], "custom_providers").Content[0], "models")
+
+	check := func(model string, want string) {
+		inner := mapGet(models, model)
+		if inner == nil {
+			t.Fatalf("models[%s] 缺失", model)
+		}
+		cl := mapGet(inner, "context_length")
+		if cl == nil || cl.Value != want {
+			t.Errorf("models[%s].context_length=%v, want %s", model, cl, want)
+		}
+	}
+	// 选中的预设模型用预设值
+	check("kimi-k2.7-code", "256000")
+	// 未选中的预设模型也各带自己的预设值
+	check("gpt-5.5", "273000")
+	check("claude-opus-4-8-cc", "1000000")
+}
+
+// 自定义（非预设）模型：无预设 → 用本配置手填的 context_length。
+func TestCustomModelContextOverride(t *testing.T) {
+	tmp := isolateHome(t)
+	cfgPath := filepath.Join(tmp, "config.yaml")
+	os.WriteFile(cfgPath, []byte("model:\n  default: x\n  provider: custom\n"), 0o600)
+	p := Profile{Name: "n", BaseURL: "https://www.dmxapi.cn/v1", APIKey: "sk-a", Model: "my-custom-x", ContextLength: 131072}
+	if _, err := applyProfileToConfig(cfgPath, p); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(cfgPath)
+	var root yaml.Node
+	yaml.Unmarshal(data, &root)
+	models := mapGet(mapGet(root.Content[0], "custom_providers").Content[0], "models")
+	inner := mapGet(models, "my-custom-x")
+	if inner == nil {
+		t.Fatal("models[my-custom-x] 缺失")
+	}
+	if cl := mapGet(inner, "context_length"); cl == nil || cl.Value != "131072" {
+		t.Errorf("自定义模型应写手填的 131072, got %v", cl)
 	}
 }
 

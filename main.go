@@ -9,7 +9,7 @@ import (
 
 // 发布前需同步修改的版本号（见 CLAUDE.md）：本常量不带 v 前缀。
 const (
-	appVersion         = "1.0.2"
+	appVersion         = "1.0.3"
 	appName            = "DMXAPI Hermes 配置工具"
 	recommendedBaseURL = "https://www.dmxapi.cn/v1"
 	tokenURL           = "https://www.dmxapi.cn/token"
@@ -18,23 +18,35 @@ const (
 	recommendedModel       = "deepseek-v4-pro"
 )
 
-// presetModel 描述精选清单里的一个模型：ID 写入配置，Hint 仅用于显示。
+// presetModel 描述精选清单里的一个模型：ID 写入配置，Hint 仅用于显示，
+// ContextLength 是该模型预设的上下文窗口（token 数），写入 Hermes 的 models[ID].context_length。
 type presetModel struct {
-	ID   string
-	Hint string
+	ID            string
+	Hint          string
+	ContextLength int
 }
 
 // presetModels 是 DMXAPI 常用对话/编码模型精选清单。
 // 折扣等描述仅用于显示（Hint），不影响写入配置的模型 ID。DMXAPI 新增模型时用"自定义输入"兜底。
 var presetModels = []presetModel{
-	{"claude-opus-4-8-cc", "Claude Opus · 3.4 折"},
-	{"claude-opus-4-8", "Claude Opus · 6.8 折"},
-	{"claude-opus-4-8-ssvip", "Claude Opus · SSVIP"},
-	{"gpt-5.5", "OpenAI · 6.8 折"},
-	{"deepseek-v4-pro", "深度求索 · 思考主推"},
-	{"deepseek-v4-flash", "深度求索 · 快速便宜"},
-	{"glm-5.2", "智谱 GLM"},
-	{"kimi-k2.7-code", "Kimi · 编码"},
+	{"claude-opus-4-8-cc", "Claude Opus · 3.4 折", 1000000},
+	{"claude-opus-4-8", "Claude Opus · 6.8 折", 1000000},
+	{"claude-opus-4-8-ssvip", "Claude Opus · SSVIP", 1000000},
+	{"gpt-5.5", "OpenAI · 6.8 折", 273000},
+	{"deepseek-v4-pro", "深度求索 · 思考主推", 1000000},
+	{"deepseek-v4-flash", "深度求索 · 快速便宜", 1000000},
+	{"glm-5.2", "智谱 GLM", 1000000},
+	{"kimi-k2.7-code", "Kimi · 编码", 256000},
+}
+
+// presetContextLength 返回某模型 ID 在精选清单里的预设上下文窗口；非精选（自定义）返回 0。
+func presetContextLength(modelID string) int {
+	for _, pm := range presetModels {
+		if pm.ID == modelID {
+			return pm.ContextLength
+		}
+	}
+	return 0
 }
 
 type action int
@@ -317,7 +329,11 @@ func addConfigFlow(configPath string, recommended bool) {
 				p.Model = m
 				return stepNext
 			},
-			func() stepResult { // 上下文窗口
+			func() stepResult { // 上下文窗口（预设模型用预设值，不单独询问；仅自定义模型才问）
+				if presetContextLength(p.Model) > 0 {
+					p.ContextLength = 0
+					return stepNext
+				}
 				printSectionHeader("配置上下文窗口")
 				c, esc := askContextLength("")
 				if esc {
@@ -426,7 +442,11 @@ func editProfile(configPath string, p Profile) {
 			}
 			return stepNext
 		},
-		func() stepResult { // 上下文窗口
+		func() stepResult { // 上下文窗口（预设模型用预设值，不单独询问；仅自定义模型才问）
+			if presetContextLength(p.Model) > 0 {
+				p.ContextLength = 0 // 预设模型：用预设值；顺带清掉可能残留的陈旧手填值
+				return stepNext
+			}
 			printSectionHeader("配置上下文窗口")
 			cur := "自动"
 			if p.ContextLength > 0 {

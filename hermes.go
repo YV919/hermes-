@@ -207,6 +207,15 @@ func mapSetBool(m *yaml.Node, key string, value bool) {
 	mapSetNode(m, key, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!bool", Value: s})
 }
 
+// modelInner 构建 custom_providers[].models[<id>] 的值节点：ctx>0 时带 context_length，否则空映射（auto）。
+func modelInner(ctx int) *yaml.Node {
+	n := &yaml.Node{Kind: yaml.MappingNode}
+	if ctx > 0 {
+		mapSetInt(n, "context_length", ctx)
+	}
+	return n
+}
+
 // applyProfileToConfig 把配置 P 写进 Hermes 的 config.yaml：内联活动 model 块 + upsert custom_providers 条目。
 // 写前自动备份，返回备份路径。
 func applyProfileToConfig(configPath string, p Profile) (backupPath string, err error) {
@@ -266,19 +275,21 @@ func applyProfileToConfig(configPath string, p Profile) (backupPath string, err 
 	// discover_models: false → Hermes 的 hermes model / /model 只显示下面 models 里的精选，
 	// 不再对 base_url 拉取全部模型（751 个）。必须是裸 bool。
 	mapSetBool(entry, "discover_models", false)
-	// models 列出全部精选模型 + 当前选中模型（含自定义）。先 preset 后 P.Model，
+	// models 列出全部精选模型（各带自己的预设 context_length）+ 当前选中模型。先 preset 后 P.Model，
 	// 用 mapSetNode 覆盖去重——P.Model 若已在精选里则覆盖而非重复 key（重复 key 会序列化报错）。
 	models := &yaml.Node{Kind: yaml.MappingNode}
 	for _, pm := range presetModels {
 		models.Content = append(models.Content,
 			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: pm.ID},
-			&yaml.Node{Kind: yaml.MappingNode})
+			modelInner(pm.ContextLength))
 	}
-	inner := &yaml.Node{Kind: yaml.MappingNode}
-	if p.ContextLength > 0 {
-		mapSetInt(inner, "context_length", p.ContextLength)
+	// 选中模型上下文窗口取值优先级：模型预设值 > 本配置手填值 > 无（auto，自定义模型）。
+	// 预设模型固定用自己的预设；只有非预设（自定义）模型才用本配置手填的 context_length。
+	selCtx := presetContextLength(p.Model)
+	if selCtx == 0 {
+		selCtx = p.ContextLength
 	}
-	mapSetNode(models, p.Model, inner) // 覆盖式写入：在精选中则覆盖，不在则追加
+	mapSetNode(models, p.Model, modelInner(selCtx)) // 覆盖式写入：在精选中则覆盖，不在则追加
 	mapSetNode(entry, "models", models)
 
 	return writeConfigAtomic(configPath, &root)
