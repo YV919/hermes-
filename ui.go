@@ -484,8 +484,9 @@ func selectMenuFrom(title string, items []menuItem, defaultIdx int) int {
 	}
 }
 
-// styledConfirm 弹"是/否"确认菜单。defaultYes 决定默认高亮项。是→true；否/ESC→false。
-func styledConfirm(label string, defaultYes bool) bool {
+// styledConfirm 弹"是/否"确认菜单。返回 (选是, 是否按ESC)。
+// ESC→(false,true)：调用方据此返回上一级；否→(false,false)；是→(true,false)。
+func styledConfirm(label string, defaultYes bool) (yes, escaped bool) {
 	items := []menuItem{
 		{Label: "是", Desc: "确认"},
 		{Label: "否", Desc: "取消 / 保持不变"},
@@ -494,7 +495,11 @@ func styledConfirm(label string, defaultYes bool) bool {
 	if defaultYes {
 		def = 0
 	}
-	return selectMenuFrom(label, items, def) == 0
+	idx := selectMenuFrom(label, items, def)
+	if idx < 0 {
+		return false, true
+	}
+	return idx == 0, false
 }
 
 // drawMenu 以单线圆角盒子渲染菜单：顶部居中标题 + 分隔线 + 各项（标签/描述两列对齐），

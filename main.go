@@ -9,7 +9,7 @@ import (
 
 // 发布前需同步修改的版本号（见 CLAUDE.md）：本常量不带 v 前缀。
 const (
-	appVersion         = "1.0.0"
+	appVersion         = "1.0.1"
 	appName            = "DMXAPI Hermes 配置工具"
 	recommendedBaseURL = "https://www.dmxapi.cn/v1"
 	tokenURL           = "https://www.dmxapi.cn/token"
@@ -176,207 +176,312 @@ func printHelp() {
 	fmt.Println("  dmxapi-hermes --help       显示本帮助")
 }
 
+// stepResult 是步进流程里单步的去向。
+type stepResult int
+
+const (
+	stepNext stepResult = iota // 进入下一步
+	stepBack                   // 退回上一步（首步 back = 退出整个流程，回上一级）
+	stepStay                   // 重显本步（如子输入按 ESC 回到本步确认）
+	stepExit                   // 完成或取消，结束流程
+)
+
+// runSteps 逐步驱动多步流程：每步前清屏，按返回值前进/后退/重显/退出。
+// 在第一步按 back 即退出整个流程（回到调用方的上一级页面）。
+func runSteps(steps []func() stepResult) {
+	i := 0
+	for i < len(steps) {
+		clearScreen()
+		switch steps[i]() {
+		case stepNext:
+			i++
+		case stepBack:
+			i--
+			if i < 0 {
+				return
+			}
+		case stepStay:
+			// i 不变，重显本步
+		case stepExit:
+			return
+		}
+	}
+}
+
 // addConfigFlow 新增一套配置（recommended=true 时预填 DMXAPI 地址）。
 func addConfigFlow(configPath string, recommended bool) {
-	clearScreen()
+	var p Profile
 
-	var name, baseURL, model, apiKey string
-	var ctx int
+	// 收尾步：校验 → 保存 → 是否应用。两分支共用。
+	finish := func() stepResult {
+		printInfo("正在校验密钥与模型...")
+		if err := validateChat(p.BaseURL, p.APIKey, p.Model); err != nil {
+			printWarning("校验未通过：" + err.Error())
+			yes, esc := styledConfirm("仍然保存此配置吗？", false)
+			if esc {
+				return stepBack // 回上一步改正
+			}
+			if !yes {
+				return stepExit // 否 → 取消
+			}
+		} else {
+			printSuccess("校验通过：密钥有效、模型可用 ✔")
+		}
+		if err := saveProfile(p); err != nil {
+			printError("保存失败：" + err.Error())
+			waitReturn()
+			return stepExit
+		}
+		printSuccess("配置已保存：" + p.Name)
+		printConfigSummary(p)
+		yes, esc := styledConfirm("是否立即设为 Hermes 当前生效？", true)
+		if esc {
+			return stepExit
+		}
+		if yes {
+			applyAndReport(configPath, p)
+		} else {
+			printWarning("配置已保存，但尚未生效——Hermes 仍在用旧配置。")
+			printInfo("随时可在主菜单选中本配置→应用此配置，或运行：dmxapi-hermes --switch " + p.Name)
+		}
+		waitReturn()
+		return stepExit
+	}
 
+	var steps []func() stepResult
 	if recommended {
 		// 一键：名称 / 地址 / 模型 全部预设，只问密钥。
-		printSectionHeader("DMXAPI 推荐配置")
-		name = recommendedProfileName
-		baseURL = recommendedBaseURL
-		model = recommendedModel
-		ctx = 0
-		printInfo("已为你预填以下配置，只需填写密钥：")
-		printInfo("配置名称：" + name)
-		printInfo("Base URL：" + baseURL)
-		printInfo("模型：" + model)
-
-		printSectionHeader("配置 API 认证令牌")
-		printTip("获取地址: " + tokenURL)
-		key, esc := mustPassword("API 密钥 (sk-...)")
-		if esc {
-			return
-		}
-		apiKey = key
-	} else {
-		printSectionHeader("新增 DMXAPI 配置")
-
-		n, esc := mustInput("配置名称（如 flash日常）")
-		if esc {
-			return
-		}
-		name = n
-
-		printSectionHeader("配置 API 服务器地址")
-		fmt.Println("  示例: " + recommendedBaseURL)
-		baseURLraw, esc := styledInputDefault("Base URL", recommendedBaseURL)
-		if esc {
-			return
-		}
-		baseURL = normalizeBaseURL(baseURLraw)
-		if baseURL == "" {
-			baseURL = recommendedBaseURL
-		}
-
-		printSectionHeader("配置 API 认证令牌")
-		printTip("获取地址: " + tokenURL)
-		key, esc := mustPassword("API 密钥 (sk-...)")
-		if esc {
-			return
-		}
-		apiKey = key
-
-		printSectionHeader("配置模型")
-		m := pickModel()
-		if m == "" {
-			return
-		}
-		model = m
-
-		c, esc := askContextLength("")
-		if esc {
-			return
-		}
-		ctx = c
-	}
-
-	p := Profile{Name: name, BaseURL: baseURL, APIKey: apiKey, Model: model, ContextLength: ctx}
-
-	printInfo("正在校验密钥与模型...")
-	if err := validateChat(baseURL, apiKey, model); err != nil {
-		printWarning("校验未通过：" + err.Error())
-		if !styledConfirm("仍然保存此配置吗？", false) {
-			return
+		p.Name = recommendedProfileName
+		p.BaseURL = recommendedBaseURL
+		p.Model = recommendedModel
+		p.ContextLength = 0
+		steps = []func() stepResult{
+			func() stepResult {
+				printSectionHeader("DMXAPI 推荐配置")
+				printInfo("已为你预填以下配置，只需填写密钥：")
+				printInfo("配置名称：" + p.Name)
+				printInfo("Base URL：" + p.BaseURL)
+				printInfo("模型：" + p.Model)
+				printSectionHeader("配置 API 认证令牌")
+				printTip("获取地址: " + tokenURL)
+				key, esc := mustPassword("API 密钥 (sk-...)")
+				if esc {
+					return stepBack
+				}
+				p.APIKey = key
+				return stepNext
+			},
+			finish,
 		}
 	} else {
-		printSuccess("校验通过：密钥有效、模型可用 ✔")
+		steps = []func() stepResult{
+			func() stepResult { // 名称
+				printSectionHeader("新增 DMXAPI 配置")
+				n, esc := mustInput("配置名称（如 flash日常）")
+				if esc {
+					return stepBack
+				}
+				p.Name = n
+				return stepNext
+			},
+			func() stepResult { // Base URL
+				printSectionHeader("配置 API 服务器地址")
+				fmt.Println("  示例: " + recommendedBaseURL)
+				raw, esc := styledInputDefault("Base URL", recommendedBaseURL)
+				if esc {
+					return stepBack
+				}
+				bu := normalizeBaseURL(raw)
+				if bu == "" {
+					bu = recommendedBaseURL
+				}
+				p.BaseURL = bu
+				return stepNext
+			},
+			func() stepResult { // 密钥
+				printSectionHeader("配置 API 认证令牌")
+				printTip("获取地址: " + tokenURL)
+				key, esc := mustPassword("API 密钥 (sk-...)")
+				if esc {
+					return stepBack
+				}
+				p.APIKey = key
+				return stepNext
+			},
+			func() stepResult { // 模型
+				printSectionHeader("配置模型")
+				m := pickModel()
+				if m == "" {
+					return stepBack
+				}
+				p.Model = m
+				return stepNext
+			},
+			func() stepResult { // 上下文窗口
+				printSectionHeader("配置上下文窗口")
+				c, esc := askContextLength("")
+				if esc {
+					return stepBack
+				}
+				p.ContextLength = c
+				return stepNext
+			},
+			finish,
+		}
 	}
-
-	if err := saveProfile(p); err != nil {
-		printError("保存失败：" + err.Error())
-		waitReturn()
-		return
-	}
-	printSuccess("配置已保存：" + name)
-
-	printConfigSummary(p)
-	if styledConfirm("是否立即设为 Hermes 当前生效？", true) {
-		applyAndReport(configPath, p)
-	} else {
-		printWarning("配置已保存，但尚未生效——Hermes 仍在用旧配置。")
-		printInfo("随时可在主菜单选中本配置→应用此配置，或运行：dmxapi-hermes --switch " + p.Name)
-	}
-	waitReturn()
+	runSteps(steps)
 }
 
 // manageProfileFlow 管理一套已保存配置：显示摘要 + 应用/编辑/删除。
 func manageProfileFlow(configPath string, p Profile) {
-	clearScreen()
-	printSectionHeader("配置：" + p.Name)
-	printConfigSummary(p)
-	idx := selectMenu("管理配置「"+p.Name+"」", []menuItem{
-		{Label: "✅ 应用此配置", Desc: "设为 Hermes 当前生效"},
-		{Label: "✏️  编辑此配置", Desc: "修改 base_url / 密钥 / 模型 / 上下文"},
-		{Label: "🗑️  删除此配置", Desc: "从配置库移除"},
-	})
-	switch idx {
-	case 0:
-		switchToProfile(configPath, p)
-		waitReturn()
-	case 1:
-		editProfile(configPath, p)
-	case 2:
-		if !styledConfirm("确定删除「"+p.Name+"」吗？", false) {
+	for {
+		clearScreen()
+		printSectionHeader("配置：" + p.Name)
+		printConfigSummary(p)
+		idx := selectMenu("管理配置「"+p.Name+"」", []menuItem{
+			{Label: "✅ 应用此配置", Desc: "设为 Hermes 当前生效"},
+			{Label: "✏️  编辑此配置", Desc: "修改 base_url / 密钥 / 模型 / 上下文"},
+			{Label: "🗑️  删除此配置", Desc: "从配置库移除"},
+		})
+		switch idx {
+		case 0:
+			switchToProfile(configPath, p)
+			waitReturn()
+		case 1:
+			editProfile(configPath, p)
+			// 编辑可能改了配置，重载以在管理页显示最新值
+			if fresh, err := loadProfile(p.Name); err == nil {
+				p = fresh
+			}
+		case 2:
+			yes, esc := styledConfirm("确定删除「"+p.Name+"」吗？", false)
+			if esc || !yes {
+				continue // 取消删除 → 回管理页
+			}
+			if err := deleteProfile(p.Name); err != nil {
+				printError("删除失败：" + err.Error())
+				waitReturn()
+				continue
+			}
+			printSuccess("已删除：" + p.Name)
+			waitReturn()
+			return // 配置已不存在 → 回主菜单
+		default: // ESC：返回主菜单
 			return
 		}
-		if err := deleteProfile(p.Name); err != nil {
-			printError("删除失败：" + err.Error())
-		} else {
-			printSuccess("已删除：" + p.Name)
-		}
-		waitReturn()
-	default: // ESC：返回主菜单
-		return
 	}
 }
 
 // editProfile 编辑单套配置：每个字段走"显示当前值 + 是否修改"模式。
+// 步进式：每步 ESC 退回上一步，首步 ESC 退回管理页。
 func editProfile(configPath string, p Profile) {
-	clearScreen()
-	printSectionHeader("配置 API 服务器地址")
-	fmt.Println("  示例: " + recommendedBaseURL)
-	fmt.Println("  当前值: " + p.BaseURL)
-	if styledConfirm("是否修改 Base URL", false) {
-		v, esc := mustInput("Base URL")
-		if esc {
-			return
-		}
-		p.BaseURL = normalizeBaseURL(v)
+	steps := []func() stepResult{
+		func() stepResult { // Base URL
+			printSectionHeader("配置 API 服务器地址")
+			fmt.Println("  示例: " + recommendedBaseURL)
+			fmt.Println("  当前值: " + p.BaseURL)
+			yes, esc := styledConfirm("是否修改 Base URL", false)
+			if esc {
+				return stepBack
+			}
+			if yes {
+				v, e := mustInput("Base URL")
+				if e {
+					return stepStay // 子输入 ESC → 回本步确认
+				}
+				p.BaseURL = normalizeBaseURL(v)
+			}
+			return stepNext
+		},
+		func() stepResult { // Token
+			printSectionHeader("配置 API 认证令牌")
+			printTip("获取地址: " + tokenURL)
+			fmt.Println("  当前已配置 Token: " + maskKey(p.APIKey))
+			yes, esc := styledConfirm("是否更新 Token", false)
+			if esc {
+				return stepBack
+			}
+			if yes {
+				v, e := mustPassword("API 密钥 (sk-...)")
+				if e {
+					return stepStay
+				}
+				p.APIKey = v
+			}
+			return stepNext
+		},
+		func() stepResult { // 模型
+			printSectionHeader("配置模型")
+			fmt.Println("  当前: " + p.Model)
+			yes, esc := styledConfirm("是否修改模型", false)
+			if esc {
+				return stepBack
+			}
+			if yes {
+				if m := pickModel(); m != "" {
+					p.Model = m
+				} else {
+					return stepStay
+				}
+			}
+			return stepNext
+		},
+		func() stepResult { // 上下文窗口
+			printSectionHeader("配置上下文窗口")
+			cur := "自动"
+			if p.ContextLength > 0 {
+				cur = strconv.Itoa(p.ContextLength)
+			}
+			fmt.Println("  当前: " + cur)
+			yes, esc := styledConfirm("是否修改上下文窗口", false)
+			if esc {
+				return stepBack
+			}
+			if yes {
+				n, e := askContextLength(strconv.Itoa(p.ContextLength))
+				if e {
+					return stepStay
+				}
+				p.ContextLength = n
+			}
+			return stepNext
+		},
+		func() stepResult { // 校验 → 保存 → 应用
+			printInfo("正在校验密钥与模型...")
+			if err := validateChat(p.BaseURL, p.APIKey, p.Model); err != nil {
+				printWarning("校验未通过：" + err.Error())
+				yes, esc := styledConfirm("仍然保存此修改吗？", false)
+				if esc {
+					return stepBack // 回最后字段步改正
+				}
+				if !yes {
+					return stepExit
+				}
+			} else {
+				printSuccess("校验通过：密钥有效、模型可用 ✔")
+			}
+			if err := saveProfile(p); err != nil {
+				printError("保存失败：" + err.Error())
+				waitReturn()
+				return stepExit
+			}
+			printSuccess("已保存修改。")
+			printConfigSummary(p)
+			yes, esc := styledConfirm("立即应用到 Hermes？", true)
+			if esc {
+				return stepExit
+			}
+			if yes {
+				applyAndReport(configPath, p)
+			} else {
+				printWarning("修改已保存，但尚未生效——Hermes 仍在用旧配置。")
+				printInfo("随时可在主菜单选中本配置→应用此配置，或运行：dmxapi-hermes --switch " + p.Name)
+			}
+			waitReturn()
+			return stepExit
+		},
 	}
-
-	printSectionHeader("配置 API 认证令牌")
-	printTip("获取地址: " + tokenURL)
-	fmt.Println("  当前已配置 Token: " + maskKey(p.APIKey))
-	if styledConfirm("是否更新 Token", false) {
-		v, esc := mustPassword("API 密钥 (sk-...)")
-		if esc {
-			return
-		}
-		p.APIKey = v
-	}
-
-	printSectionHeader("配置模型")
-	fmt.Println("  当前: " + p.Model)
-	if styledConfirm("是否修改模型", false) {
-		m := pickModel()
-		if m == "" {
-			return
-		}
-		p.Model = m
-	}
-
-	printSectionHeader("配置上下文窗口")
-	cur := "自动"
-	if p.ContextLength > 0 {
-		cur = strconv.Itoa(p.ContextLength)
-	}
-	fmt.Println("  当前: " + cur)
-	if styledConfirm("是否修改上下文窗口", false) {
-		n, esc := askContextLength(strconv.Itoa(p.ContextLength))
-		if esc {
-			return
-		}
-		p.ContextLength = n
-	}
-
-	printInfo("正在校验密钥与模型...")
-	if err := validateChat(p.BaseURL, p.APIKey, p.Model); err != nil {
-		printWarning("校验未通过：" + err.Error())
-		if !styledConfirm("仍然保存此修改吗？", false) {
-			return
-		}
-	} else {
-		printSuccess("校验通过：密钥有效、模型可用 ✔")
-	}
-
-	if err := saveProfile(p); err != nil {
-		printError("保存失败：" + err.Error())
-		waitReturn()
-		return
-	}
-	printSuccess("已保存修改。")
-	printConfigSummary(p)
-	if styledConfirm("立即应用到 Hermes？", true) {
-		applyAndReport(configPath, p)
-	} else {
-		printWarning("修改已保存，但尚未生效——Hermes 仍在用旧配置。")
-		printInfo("随时可在主菜单选中本配置→应用此配置，或运行：dmxapi-hermes --switch " + p.Name)
-	}
-	waitReturn()
+	runSteps(steps)
 }
 
 // switchToProfile 一键把某套配置设为 Hermes 当前生效。
@@ -439,7 +544,8 @@ func clearCurrentFlow(configPath string) {
 		return
 	}
 	printWarning("将清除当前生效配置（model 块），已保存的命名配置保留。")
-	if !styledConfirm("确定清除当前生效配置吗？", false) {
+	yes, esc := styledConfirm("确定清除当前生效配置吗？", false)
+	if esc || !yes {
 		return
 	}
 	backup, err := clearActiveModel(configPath)
@@ -459,7 +565,8 @@ func clearAllFlow(configPath string) {
 	profiles, _ := listProfiles()
 	printWarning(fmt.Sprintf("将删除全部 %d 套已保存配置，并清除 Hermes 当前生效配置 + 本工具写入的 custom_providers 条目。", len(profiles)))
 	printWarning("此操作不可撤销（Hermes 配置会自动备份）。")
-	if !styledConfirm("确定清除所有配置吗？", false) {
+	yes, esc := styledConfirm("确定清除所有配置吗？", false)
+	if esc || !yes {
 		return
 	}
 
@@ -512,7 +619,8 @@ func clearOneProfileFlow() {
 		return
 	}
 	p := profiles[idx]
-	if !styledConfirm("确定删除「"+p.Name+"」吗？", false) {
+	yes, esc := styledConfirm("确定删除「"+p.Name+"」吗？", false)
+	if esc || !yes {
 		return
 	}
 	if err := deleteProfile(p.Name); err != nil {
