@@ -691,3 +691,25 @@ auxiliary:
 		t.Errorf("clearToolConfig 后 auxiliary.title_generation.model 应清空, got %v", v)
 	}
 }
+
+// detectConflictEnvVars 只检出被设置（非空）的相关环境变量；空/未设的不算。
+func TestDetectConflictEnvVars(t *testing.T) {
+	// 先把名单里的都设为空 → 隔离真实环境，不应检出
+	for _, n := range conflictEnvVars {
+		t.Setenv(n, "")
+	}
+	if got := detectConflictEnvVars(); len(got) != 0 {
+		t.Errorf("空环境不应检出, got %v", got)
+	}
+	// 设一个非空 → 应检出它
+	t.Setenv("OPENAI_API_KEY", "sk-xxx")
+	hit := false
+	for _, n := range detectConflictEnvVars() {
+		if n == "OPENAI_API_KEY" {
+			hit = true
+		}
+	}
+	if !hit {
+		t.Errorf("应检出 OPENAI_API_KEY, got %v", detectConflictEnvVars())
+	}
+}

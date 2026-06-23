@@ -3,13 +3,14 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 )
 
 // 发布前需同步修改的版本号（见 CLAUDE.md）：本常量不带 v 前缀。
 const (
-	appVersion         = "1.1.1"
+	appVersion         = "1.1.2"
 	appName            = "DMXAPI Hermes 配置工具"
 	recommendedBaseURL = "https://www.dmxapi.cn/v1"
 	tokenURL           = "https://www.dmxapi.cn/token"
@@ -650,7 +651,63 @@ func clearAllFlow(configPath string) {
 		return
 	}
 	printSuccess(fmt.Sprintf("已删除 %d 套命名配置。", n))
+
+	// 3) 检测可能残留的相关环境变量并提示手动删除（工具从不设环境变量，故只检测+提示，绝不自动删）
+	reportConflictEnvVars()
 	waitReturn()
+}
+
+// conflictEnvVars 是「可能与 Hermes（走 DMXAPI/OpenAI 兼容）冲突或冗余」的常见环境变量名。
+// 本工具从不设置它们；仅在清除所有配置时检测它们是否被手动设过，提示用户手动删除（不自动删）。
+var conflictEnvVars = []string{
+	"OPENAI_API_KEY",
+	"OPENAI_BASE_URL",
+	"OPENAI_API_BASE",
+}
+
+// detectConflictEnvVars 返回当前进程环境里被设置（非空）的可能冲突变量名。只读，不修改环境。
+func detectConflictEnvVars() []string {
+	var found []string
+	for _, name := range conflictEnvVars {
+		if strings.TrimSpace(os.Getenv(name)) != "" {
+			found = append(found, name)
+		}
+	}
+	return found
+}
+
+// reportConflictEnvVars 检测可能残留的相关环境变量并提示手动删除——只读检测 + 打印命令，绝不修改环境。
+func reportConflictEnvVars() {
+	found := detectConflictEnvVars()
+	if len(found) == 0 {
+		printInfo("未检测到可能冲突的环境变量（OPENAI_API_KEY / OPENAI_BASE_URL 等），环境干净。")
+		return
+	}
+	printWarning("检测到以下可能冲突/冗余的环境变量（本工具不会自动删除）：")
+	for _, name := range found {
+		fmt.Println("    " + name)
+	}
+	printInfo("Hermes 读 config.yaml、不读环境变量；这些多半是你手动设过的，且可能被其它工具共用。")
+	printInfo("如确认要删除，请按当前系统手动执行（删完需重开终端才生效）：")
+	printEnvRemovalHelp(found)
+}
+
+// printEnvRemovalHelp 按当前系统打印删除指定环境变量的命令——仅提示，绝不代为执行。
+func printEnvRemovalHelp(names []string) {
+	if runtime.GOOS == "windows" {
+		printTip("PowerShell（持久，当前用户）：")
+		for _, n := range names {
+			fmt.Println("    [Environment]::SetEnvironmentVariable('" + n + "', $null, 'User')")
+		}
+		printTip("或 CMD：")
+		for _, n := range names {
+			fmt.Println("    reg delete \"HKCU\\Environment\" /v " + n + " /f")
+		}
+		return
+	}
+	printTip("当前会话临时取消：")
+	fmt.Println("    unset " + strings.Join(names, " "))
+	printTip("永久移除：从 ~/.bashrc、~/.zshrc 或 ~/.profile 里删掉对应的 export 行。")
 }
 
 // clearOneProfileFlow 选择并删除某个已保存的命名配置（仅删 JSON，不动 Hermes 配置）。
